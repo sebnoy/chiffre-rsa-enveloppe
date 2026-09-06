@@ -1,0 +1,9 @@
+/target
+# Cargo.lock est committé volontairement : le workspace contient un
+# binaire (chiffre_aes_cli), pour lequel c'est la pratique recommandée
+# (contrairement à une bibliothèque pure).
+.idea/
+.vscode/
+*.swp
+fuzz/target
+fuzz/artifacts
