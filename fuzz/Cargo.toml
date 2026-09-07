@@ -37,3 +37,17 @@ path = "fuzz_targets/encrypt_decrypt_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "decrypt_paths_with_key"
+path = "fuzz_targets/decrypt_paths_with_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encrypt_decrypt_paths_roundtrip"
+path = "fuzz_targets/encrypt_decrypt_paths_roundtrip.rs"
+test = false
+doc = false
+bench = false

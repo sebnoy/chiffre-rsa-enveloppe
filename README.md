@@ -3,9 +3,10 @@
 Orchestration multi-destinataires : produit ou lit un fichier `.enc`
 complet en combinant `chiffre-rsa-core` (scellement/descellement RSA-OAEP
 de la clé de contenu) et `chiffre_aes_core` (format de fichier v2,
-chiffrement symétrique). Deux fonctions, volontairement peu nombreuses :
+chiffrement symétrique). Quatre fonctions :
 
 ```rust
+// Mono-fichier — pas de dépendance à chiffre_aes_core::archive.
 pub fn encrypt_file_for_recipients(
     input: &Path,
     output: &Path,
@@ -17,6 +18,19 @@ pub fn decrypt_file_with_key(
     output: &Path,
     key: &RsaKeyPair,
 ) -> Result<(), EnvelopeError>;
+
+// Multi-fichiers/dossiers — voir §Archives multi-fichiers ci-dessous.
+pub fn encrypt_paths_for_recipients(
+    selected_paths: &[PathBuf],
+    output: &Path,
+    recipients: &[RecipientRef],
+) -> Result<Vec<chiffre_aes_core::ArchiveWarning>, EnvelopeError>;
+
+pub fn decrypt_paths_with_key(
+    input: &Path,
+    destination_dir: &Path,
+    key: &RsaKeyPair,
+) -> Result<Vec<chiffre_aes_core::ArchiveWarning>, EnvelopeError>;
 ```
 
 # Statut
@@ -80,6 +94,49 @@ Partie 2 §2).
 4. Descelle la CEK (`RsaKeyPair::unwrap_key`) et délègue le déchiffrement
    à `chiffre_aes_core::decrypt_file_with_raw_key`.
 
+# Archives multi-fichiers (`encrypt_paths_for_recipients`/`decrypt_paths_with_key`)
+
+Combine `chiffre_aes_core::archive::build_archive`/`extract_archive`
+(déjà utilisé pour la voie mot de passe par
+`chiffre_aes_core::pipeline`, mais jamais câblé pour la voie RSA avant
+ce crate) avec les mêmes primitives RSA que la voie mono-fichier. Un seul
+fichier n'est qu'un cas particulier de `selected_paths` à un élément —
+pas de logique dupliquée entre les deux voies au-delà de ce qui est
+inhérent à l'archivage.
+
+## Métadonnées optionnelles injectées par l'application
+
+Deux fichiers réservés, **injectés par l'application** (pas par ce
+crate — il archive simplement ce qu'on lui donne dans `selected_paths`,
+sans traitement spécial pour ces noms) dans le dossier temporaire avant
+l'appel, voir `FORMAT.md` §5.1 :
+
+| Fichier | Contenu | Visible par |
+|---|---|---|
+| `_expediteur.json` | Document de clé signé de l'expéditeur (`chiffre-rsa-keystore`) | Uniquement les destinataires (dans le contenu chiffré) |
+| `_destinataires.json` | Liste `[{ firstname, lastname, organisation, fingerprint }, ...]`, incluant l'expéditeur | Idem — effet "liste CC" voulu, pas une fuite |
+
+Ces deux inclusions sont des choix de l'application, indépendants l'un de
+l'autre. **Collision de nom** : `encrypt_paths_for_recipients` détecte
+et refuse (`EnvelopeError::DuplicateArchiveEntryName`) toute paire de
+chemins de `selected_paths` qui produirait la même entrée d'archive —
+vérification générale, qui couvre ce cas sans traitement spécial des
+deux noms réservés ; voir `FORMAT.md` §5.4 pour ce qu'elle ne couvre
+**pas** (un seul fichier, par erreur nommé `_expediteur.json`, sans
+collision réelle).
+
+## Atomicité de l'extraction
+
+`decrypt_paths_with_key` désarchive **toujours** d'abord vers un dossier
+temporaire sœur de `destination_dir`, jamais directement dedans. Bascule
+finale : `rename` unique si `destination_dir` n'existe pas encore ;
+déplacement entrée par entrée **en deux passes** (validation intégrale,
+puis déplacement seulement si aucune collision) si `destination_dir`
+existe déjà — une collision détectée retourne
+`EnvelopeError::DestinationConflict` sans rien déplacer. Voir `FORMAT.md`
+§5.2 pour le détail, y compris la limite restante assumée (pas de
+verrou inter-processus entre les deux passes).
+
 # Ce que ce crate ne fait pas
 
 - Pas de vérification de confiance sur les clés publiques (voir
@@ -109,7 +166,7 @@ cargo test
 
 ## Fuzzing
 
-Voir [fuzz/](./fuzz/) et [FORMAT.md](./FORMAT.md) §6. Deux cibles :
+Voir [fuzz/](./fuzz/) et [FORMAT.md](./FORMAT.md) §6. Quatre cibles :
 
 - `decrypt_file_with_key` — contenu de fichier `.enc` arbitraire, clé
   privée fixe. Couvre la combinaison `inspect_key_requirement` →
@@ -117,11 +174,27 @@ Voir [fuzz/](./fuzz/) et [FORMAT.md](./FORMAT.md) §6. Deux cibles :
   `chiffre_aes_core` ni `chiffre-rsa-core` ne l'exercent seuls).
 - `encrypt_decrypt_roundtrip` — test de propriété (pas de robustesse
   face à un attaquant) : contenu de fichier arbitraire chiffré puis
-  déchiffré doit redonner exactement le même contenu.
+  déchiffré doit redonner exactement le même contenu (voie mono-fichier).
+- `decrypt_paths_with_key` — même surface que `decrypt_file_with_key`,
+  via la voie archive multi-fichiers.
+- `encrypt_decrypt_paths_roundtrip` — même principe que
+  `encrypt_decrypt_roundtrip`, mais à travers une vraie archive
+  multi-entrées (`build_archive`/`extract_archive`), pas seulement un
+  flux chiffré unique.
 
 ```bash
 cargo +nightly fuzz run decrypt_file_with_key -- -max_total_time=120
 cargo +nightly fuzz run encrypt_decrypt_roundtrip -- -max_total_time=120
+cargo +nightly fuzz run decrypt_paths_with_key -- -max_total_time=120
+cargo +nightly fuzz run encrypt_decrypt_paths_roundtrip -- -max_total_time=120
+```
+
+Pour un seed réaliste de `decrypt_paths_with_key` (un vrai `.enc`
+multi-fichiers plutôt que le squelette `ENC1`+zéros fourni par défaut) :
+
+```bash
+cargo run --example gen_paths_seed -- seed.enc fichier1.txt fichier2.txt
+cp seed.enc fuzz/corpus/decrypt_paths_with_key/
 ```
 
 

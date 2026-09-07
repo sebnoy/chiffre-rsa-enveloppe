@@ -14,12 +14,13 @@ cargo about generate about.hbs > NOTICE.md
 | chiffre-rsa-core | MIT OR Apache-2.0 (ce projet — voir sa propre `NOTICE.md`) |
 | chiffre_aes_core | MIT OR Apache-2.0 (voir sa propre `NOTICE.md` — même remarque de statut que ci-dessous) |
 | thiserror | MIT OR Apache-2.0 |
+| tempfile | MIT OR Apache-2.0 — passé de dépendance de développement à dépendance normale (utilisée par `encrypt_paths_for_recipients`/`decrypt_paths_with_key` pour les fichiers/dossiers temporaires) |
 
 ## Dépendances de développement uniquement (tests)
 
 | Crate | Licence |
 |---|---|
-| tempfile | MIT OR Apache-2.0 |
+| zeroize | Apache-2.0 OR MIT |
 
 ## Dépendance de statut particulier : `chiffre_aes_core`
 

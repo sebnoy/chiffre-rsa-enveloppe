@@ -223,6 +223,7 @@ version = "0.1.0"
 dependencies = [
  "chiffre-rsa-core",
  "chiffre_aes_core",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
