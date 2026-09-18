@@ -214,7 +214,7 @@ pas un comportement attendu face à une entrée hostile.
 
 ## 7. Statut
 
-Document à jour à la date de rédaction (crate v0.1.0). Si un jour
+Document à jour à la date de rédaction (crate v1.0.0). Si un jour
 `recipient_id` cesse d'être l'empreinte complète (par exemple pour des
 raisons de taille de header avec un très grand nombre de destinataires),
 ce fichier fait foi sur la convention réellement appliquée, indépendamment

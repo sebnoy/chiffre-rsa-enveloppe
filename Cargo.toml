@@ -1,13 +1,15 @@
 [package]
 name = "chiffre-rsa-enveloppe"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Orchestration multi-destinataires : produit/lit un .enc complet via chiffre-aes-core + chiffre-rsa-core"
+repository = "https://github.com/sebnoy/chiffre-rsa-enveloppe"
+readme = "README.md"
 
 [dependencies]
-chiffre_aes_core = { git = "https://github.com/sebnoy/chiffre-aes-core", rev = "693b2a5" }
-chiffre-rsa-core = { path = "../chiffre-rsa-core" }
+chiffre_aes_core = { git = "https://github.com/sebnoy/chiffre-aes-core", tag = "v2.0.0" }
+chiffre-rsa-core = { git = "https://github.com/sebnoy/chiffre-rsa-core", tag = "v1.0.0" }
 thiserror = "1"
 tempfile = "3.20"
 

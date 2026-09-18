@@ -35,10 +35,10 @@ pub fn decrypt_paths_with_key(
 
 # Statut
 
-v0.1.0, pas encore publié. Dépend de `chiffre-rsa-core` (même dépôt,
-`../chiffre-rsa-core`) et de `chiffre_aes_core` via une révision git
-précise en attendant une release taguée incluant le header v2 — voir
-[NOTICE.md](./NOTICE.md).
+v1.0.0. Dépend de `chiffre-rsa-core` v1.0.0 (tag Git) et de
+`chiffre_aes_core` v2.0.0 (tag Git, incluant le header v2) — voir
+[NOTICE.md](./NOTICE.md) pour l'état exact de cette chaîne de
+dépendances.
 
 Ce crate ne connaît **jamais** de métadonnées ni de format JSON de
 confiance (futur, confiné à `chiffre-rsa-keystore`). Il ne fait non plus
@@ -203,6 +203,14 @@ cp seed.enc fuzz/corpus/decrypt_paths_with_key/
 Mêmes prérequis que `chiffre-rsa-core` : toolchain Rust ≥ 1.85
 (édition 2024, requise transitivement par `chiffre_aes_core` →
 `aes-gcm 0.11`).
+
+# Transparence et réutilisation
+
+Comme le reste de l'écosystème `chiffre-*`, ce crate documente ses
+choix (y compris ceux qu'il ne fait pas, cf. "Ce que ce crate ne fait
+pas" ci-dessus) pour que quiconque l'évalue ou le réutilise puisse le
+faire en connaissance de cause, sans avoir à relire le code source
+pour en retrouver les hypothèses.
 
 # Licence
 
