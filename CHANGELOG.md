@@ -1,5 +1,10 @@
 # Changelog
 
+
+## v1.1.0
+Ajout variable d'environnement : pub const VERSION
+
+
 ## v1.0.0
 
 Première version publiée de `chiffre-rsa-enveloppe` — orchestration

@@ -12,6 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
+/// Version de ce crate (`Cargo.toml`) 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use chiffre_aes_core::{ArchiveWarning, HeaderKeyRequirement, RawKey, Recipient};
 use chiffre_rsa_core::{RsaKeyPair, RsaKeysError, RsaPublicKey};
 
