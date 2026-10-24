@@ -1,0 +1,23 @@
+# Configuration de `cargo audit` (lue dans `.cargo/audit.toml`).
+#
+# Audit ANSSI du 24/10/2026, règle LIBS-AUDIT : chaque avis ignoré ici
+# doit être justifié. Le rapport complet est dans REPO/audit/.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 — crate `rsa`, attaque « Marvin » : une mesure fine
+    # du temps des opérations à clé privée pourrait permettre de retrouver
+    # la clé. Aucune version corrigée n'est publiée.
+    #
+    # Non exploitable dans nos usages :
+    # - le serveur ne fait que des vérifications de signature (clé
+    #   publique), jamais d'opération à clé privée ;
+    # - le déchiffrement RSA-OAEP et la signature RSA-PSS (aveuglée,
+    #   `BlindedSigningKey`) se font sur l'appareil de l'utilisateur, hors
+    #   de portée d'un attaquant distant capable de chronométrer ;
+    # - outils d'administration : l'authentification SSH par clé RSA
+    #   (russh) ne vise que nos propres serveurs.
+    #
+    # À réexaminer quand une version stable de `rsa` corrige l'avis.
+    "RUSTSEC-2023-0071",
+]

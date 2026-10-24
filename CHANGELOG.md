@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.1.1
+
+Version de maintenance issue d'un audit selon le *Guide de développement
+sécurisé en Rust* de l'ANSSI. **Aucun changement de code, de format ni
+d'API.**
+
+- **Dépendances : tags `v2.1.1`** de `chiffre-aes-core` et **`v1.2.1`** de
+  `chiffre-rsa-core` (versions de maintenance). Une application qui utilise
+  plusieurs de ces crates doit les prendre aux mêmes tags, faute de quoi
+  `Password`, `RawKey` et les clés RSA existent en deux versions
+  incompatibles.
+- **Dépendances** — `ctutils` 0.4.5 dans `Cargo.lock` et `fuzz/Cargo.lock`
+  (RUSTSEC-2026-0385 : opérations qui n'étaient pas en temps constant).
+  `fuzz/Cargo.lock`, resté sur les versions 0.1.0 des crates locales, est
+  réaligné sur `fuzz/Cargo.toml`.
+- **RUSTSEC-2023-0071 (« Marvin », crate `rsa`)** — aucune version corrigée
+  n'existe. L'avis est ignoré dans `.cargo/audit.toml` (racine et `fuzz`)
+  avec sa justification (le descellement de la clé de contenu s'exécute sur
+  l'appareil du destinataire).
+- **`scripts/verifier.sh`** — enchaîne `clippy` (avertissements refusés),
+  `cargo audit` et les tests ; `cargo audit` seul pour `fuzz`.
+- Tests : les 13 tests passent inchangés ; `clippy` : aucun avertissement.
 
 ## v1.1.0
 Ajout variable d'environnement : pub const VERSION

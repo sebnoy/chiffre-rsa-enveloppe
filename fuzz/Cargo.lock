@@ -205,7 +205,22 @@ dependencies = [
 
 [[package]]
 name = "chiffre-rsa-core"
-version = "0.1.0"
+version = "1.2.1"
+dependencies = [
+ "chiffre_aes_core",
+ "pkcs8",
+ "rand_core 0.6.4",
+ "rsa",
+ "sha2 0.10.9",
+ "spki",
+ "thiserror 1.0.69",
+ "zeroize",
+]
+
+[[package]]
+name = "chiffre-rsa-core"
+version = "1.2.1"
+source = "git+https://github.com/sebnoy/chiffre-rsa-core?tag=v1.2.1#777c406a838c5f38567a67e41baaa9ec13892681"
 dependencies = [
  "chiffre_aes_core",
  "pkcs8",
@@ -219,9 +234,9 @@ dependencies = [
 
 [[package]]
 name = "chiffre-rsa-enveloppe"
-version = "0.1.0"
+version = "1.1.1"
 dependencies = [
- "chiffre-rsa-core",
+ "chiffre-rsa-core 1.2.1 (git+https://github.com/sebnoy/chiffre-rsa-core?tag=v1.2.1)",
  "chiffre_aes_core",
  "tempfile",
  "thiserror 1.0.69",
@@ -231,7 +246,7 @@ dependencies = [
 name = "chiffre-rsa-enveloppe-fuzz"
 version = "0.0.0"
 dependencies = [
- "chiffre-rsa-core",
+ "chiffre-rsa-core 1.2.1",
  "chiffre-rsa-enveloppe",
  "libfuzzer-sys",
  "tempfile",
@@ -239,8 +254,8 @@ dependencies = [
 
 [[package]]
 name = "chiffre_aes_core"
-version = "1.0.0"
-source = "git+https://github.com/sebnoy/chiffre-aes-core?rev=693b2a5#693b2a5f0a7c47e2addaf0d7f85efdf40c541f71"
+version = "2.1.1"
+source = "git+https://github.com/sebnoy/chiffre-aes-core?tag=v2.1.1#f6786942b421fe292d73357113958fed50adbf18"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -376,9 +391,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
