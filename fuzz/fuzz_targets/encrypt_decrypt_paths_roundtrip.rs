@@ -50,8 +50,7 @@ fuzz_target!(|data: &[u8]| {
     let enc_path = tmp.path().join("archive.enc");
     let dest_dir = tmp.path().join("dest");
 
-    if std::fs::write(&path_a, content_a).is_err() || std::fs::write(&path_b, content_b).is_err()
-    {
+    if std::fs::write(&path_a, content_a).is_err() || std::fs::write(&path_b, content_b).is_err() {
         return;
     }
 
@@ -64,10 +63,11 @@ fuzz_target!(|data: &[u8]| {
         &[RecipientRef {
             public_key: &public_key,
         }],
+        key,
     )
     .expect("le chiffrement pour un unique destinataire fixe ne doit jamais échouer");
 
-    decrypt_paths_with_key(&enc_path, &dest_dir, key)
+    decrypt_paths_with_key(&enc_path, &dest_dir, key, std::slice::from_ref(&public_key))
         .expect("le déchiffrement par le destinataire légitime ne doit jamais échouer");
 
     let extracted_a =
@@ -75,6 +75,12 @@ fuzz_target!(|data: &[u8]| {
     let extracted_b =
         std::fs::read(dest_dir.join("fichier_b.dat")).expect("lecture du fichier B extrait");
 
-    assert_eq!(extracted_a, content_a, "contenu du fichier A altéré par l'aller-retour");
-    assert_eq!(extracted_b, content_b, "contenu du fichier B altéré par l'aller-retour");
+    assert_eq!(
+        extracted_a, content_a,
+        "contenu du fichier A altéré par l'aller-retour"
+    );
+    assert_eq!(
+        extracted_b, content_b,
+        "contenu du fichier B altéré par l'aller-retour"
+    );
 });

@@ -56,11 +56,17 @@ fuzz_target!(|data: &[u8]| {
         &[RecipientRef {
             public_key: &public_key,
         }],
+        key,
     )
     .expect("le chiffrement pour un unique destinataire fixe ne doit jamais échouer");
 
-    decrypt_file_with_key(&enc_path, &decrypted_path, key)
-        .expect("le déchiffrement par le destinataire légitime ne doit jamais échouer");
+    decrypt_file_with_key(
+        &enc_path,
+        &decrypted_path,
+        key,
+        std::slice::from_ref(&public_key),
+    )
+    .expect("le déchiffrement par le destinataire légitime ne doit jamais échouer");
 
     let decrypted = std::fs::read(&decrypted_path).expect("lecture du fichier déchiffré");
     assert_eq!(

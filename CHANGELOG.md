@@ -1,5 +1,40 @@
 # Changelog
 
+## v2.0.0
+
+**Format v3 de `chiffre_aes_core` : chaque fichier est signé par son
+expéditeur, et le déchiffrement exige la liste des expéditeurs attendus.**
+Version majeure : API et format changent ; les fichiers 1.x (format v2) ne
+sont plus lisibles.
+
+- **Pourquoi** — en format v2, un destinataire pouvait modifier la liste des
+  destinataires ou le contenu et recalculer l'authentification, et rien
+  n'identifiait l'expéditeur : toute personne connaissant les clés publiques
+  des destinataires produisait un fichier valide.
+- **Signature RSA-PSS de l'expéditeur** (`chiffre-rsa-core`) sur l'empreinte
+  du fichier, préfixée par un domaine propre à ce crate (une signature de
+  fichier ne vaut pas pour un autre usage de la même clé). `FORMAT.md` §2.1.
+- **API** — `encrypt_*` prennent `sender: &RsaKeyPair` ; `decrypt_*` prennent
+  `expected_senders: &[RsaPublicKey]` et renvoient l'empreinte de
+  l'expéditeur vérifié. Nouvelles erreurs `SenderNotVerified`,
+  `NoExpectedSenders`. Nouvelles fonctions en mémoire
+  (`encrypt_bytes_for_recipients`, `decrypt_bytes_with_key`) et d'inspection
+  sans secret (`inspect_file`, `inspect_bytes`).
+- **Archives** — confiées à `chiffre_aes_core` : l'archive intermédiaire n'est
+  plus écrite en clair à côté du `.enc`, l'extraction n'a lieu qu'après
+  vérification complète, et le résultat est écrit de façon durable.
+  `DestinationConflict` porte désormais un message complet.
+- **Dépendances** — tags `v3.0.0` de `chiffre_aes_core` et `v2.0.0` de
+  `chiffre-rsa-core`. `zeroize` devient une dépendance normale, `tempfile`
+  une dépendance de test.
+- **Tests** — 18 tests, dont usurpation d'empreinte, signature sans préfixe et
+  expéditeur non attendu, sans aucune sortie ; cibles de fuzzing adaptées,
+  nouvelles amorces v3.
+- **Fuzzing réparé** — `fuzz/Cargo.toml` prenait `chiffre-rsa-core` par chemin
+  local alors que la bibliothèque le prend par tag : deux versions de
+  `RsaKeyPair` coexistaient et les cibles ne compilaient pas. Même tag
+  désormais des deux côtés.
+
 ## v1.1.1
 
 Version de maintenance issue d'un audit selon le *Guide de développement

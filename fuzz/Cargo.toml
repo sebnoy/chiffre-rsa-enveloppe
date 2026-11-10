@@ -16,8 +16,11 @@ tempfile = "3"
 [dependencies.chiffre-rsa-enveloppe]
 path = ".."
 
+# Même source que la bibliothèque (tag), sinon deux versions de
+# `RsaKeyPair` coexistent et les cibles ne compilent pas.
 [dependencies.chiffre-rsa-core]
-path = "../../chiffre-rsa-core"
+git = "https://github.com/sebnoy/chiffre-rsa-core"
+tag = "v2.0.0"
 
 [profile.release]
 debug = 1

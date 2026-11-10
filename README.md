@@ -1,167 +1,129 @@
 # chiffre-rsa-enveloppe
 
 Orchestration multi-destinataires : produit ou lit un fichier `.enc`
-complet en combinant `chiffre-rsa-core` (scellement/descellement RSA-OAEP
-de la clé de contenu) et `chiffre_aes_core` (format de fichier v2,
-chiffrement symétrique). Quatre fonctions :
+complet en combinant `chiffre-rsa-core` (scellement RSA-OAEP de la clé de
+contenu, signature RSA-PSS de l'expéditeur) et `chiffre_aes_core` (format
+v3 : chiffrement symétrique, engagement de clé, signature obligatoire).
 
 ```rust
-// Mono-fichier — pas de dépendance à chiffre_aes_core::archive.
-pub fn encrypt_file_for_recipients(
-    input: &Path,
-    output: &Path,
-    recipients: &[RecipientRef],
-) -> Result<(), EnvelopeError>;
+// Fichier unique
+pub fn encrypt_file_for_recipients(input: &Path, output: &Path,
+    recipients: &[RecipientRef], sender: &RsaKeyPair) -> Result<(), EnvelopeError>;
+pub fn decrypt_file_with_key(input: &Path, output: &Path, key: &RsaKeyPair,
+    expected_senders: &[RsaPublicKey]) -> Result<Fingerprint, EnvelopeError>;
 
-pub fn decrypt_file_with_key(
-    input: &Path,
-    output: &Path,
-    key: &RsaKeyPair,
-) -> Result<(), EnvelopeError>;
+// En mémoire : aucun fichier temporaire, aucun clair sur disque
+pub fn encrypt_bytes_for_recipients(plaintext: &[u8],
+    recipients: &[RecipientRef], sender: &RsaKeyPair) -> Result<Vec<u8>, EnvelopeError>;
+pub fn decrypt_bytes_with_key(container: &[u8], key: &RsaKeyPair,
+    expected_senders: &[RsaPublicKey]) -> Result<(Zeroizing<Vec<u8>>, Fingerprint), EnvelopeError>;
 
-// Multi-fichiers/dossiers — voir §Archives multi-fichiers ci-dessous.
-pub fn encrypt_paths_for_recipients(
-    selected_paths: &[PathBuf],
-    output: &Path,
-    recipients: &[RecipientRef],
-) -> Result<Vec<chiffre_aes_core::ArchiveWarning>, EnvelopeError>;
+// Fichiers et dossiers
+pub fn encrypt_paths_for_recipients(selected_paths: &[PathBuf], output: &Path,
+    recipients: &[RecipientRef], sender: &RsaKeyPair) -> Result<Vec<ArchiveWarning>, EnvelopeError>;
+pub fn decrypt_paths_with_key(input: &Path, destination_dir: &Path, key: &RsaKeyPair,
+    expected_senders: &[RsaPublicKey]) -> Result<(Vec<ArchiveWarning>, Fingerprint), EnvelopeError>;
 
-pub fn decrypt_paths_with_key(
-    input: &Path,
-    destination_dir: &Path,
-    key: &RsaKeyPair,
-) -> Result<Vec<chiffre_aes_core::ArchiveWarning>, EnvelopeError>;
+// Sans secret : expéditeur annoncé et destinataires
+pub fn inspect_file(input: &Path) -> Result<EnvelopeInfo, EnvelopeError>;
+pub fn inspect_bytes(container: &[u8]) -> Result<EnvelopeInfo, EnvelopeError>;
 ```
 
 # Statut
 
-v1.0.0. Dépend de `chiffre-rsa-core` v1.0.0 (tag Git) et de
-`chiffre_aes_core` v2.0.0 (tag Git, incluant le header v2) — voir
-[NOTICE.md](./NOTICE.md) pour l'état exact de cette chaîne de
-dépendances.
+v2.0.0. Dépend de `chiffre_aes_core` v3.0.0 et de `chiffre-rsa-core`
+v2.0.0 (tags Git) — voir [NOTICE.md](./NOTICE.md). **Les fichiers des
+versions 1.x (format v2) ne sont plus lisibles** : ce format ne protégeait
+pas contre un destinataire et n'identifiait pas l'expéditeur.
 
-Ce crate ne connaît **jamais** de métadonnées ni de format JSON de
-confiance (futur, confiné à `chiffre-rsa-keystore`). Il ne fait non plus
-**aucune** vérification de confiance sur les clés publiques fournies :
-`RecipientRef` prend une `&RsaPublicKey` telle quelle, sous l'entière
-responsabilité de l'application appelante de l'avoir déjà jugée digne de
-confiance (voir le cahier des charges du projet, tableau des interfaces,
-Partie 2 §2).
+Ce crate ne fait **aucune** vérification de confiance sur les clés
+publiques : celles des destinataires (`RecipientRef`) et des expéditeurs
+attendus sont choisies par l'application appelante, sous sa
+responsabilité (par exemple avec `chiffre-rsa-keystore`).
 
 # Comment ça s'articule
 
 ```
                     Application appelante
-                    (a déjà vérifié la confiance
-                     des clés publiques des destinataires)
+          (a déjà jugé dignes de confiance les clés des
+           destinataires et des expéditeurs attendus)
                              │
                              ▼
                   chiffre-rsa-enveloppe   ← ce crate
-     encrypt_file_for_recipients / decrypt_file_with_key
              │                                  │
-             │ wrap_key / unwrap_key            │ RawKey, Recipient,
-             │ (RSA-OAEP)                       │ HeaderKeyRequirement
+             │ wrap_key / unwrap_key (OAEP)     │ RawKey, Recipient,
+             │ sign / verify (PSS)              │ SenderSigner, SenderVerifier
              ▼                                  ▼
      chiffre-rsa-core                    chiffre_aes_core
-     (primitives RSA)                    (format .enc, AES-GCM)
+     (primitives RSA)                    (format .enc v3, AES-GCM)
 ```
 
-## Chiffrement (`encrypt_file_for_recipients`)
+## Chiffrement
 
-1. Génère une clé de contenu (CEK) aléatoire via `RawKey::generate_random()`.
-2. Pour chaque destinataire, scelle cette CEK avec sa clé publique
-   (`RsaPublicKey::wrap_key`) et calcule son `recipient_id` — l'empreinte
-   SHA-256 de sa clé publique (`RsaPublicKey::fingerprint`). **Ce choix de
-   `recipient_id` = empreinte est une décision de ce crate**, pas de
-   `chiffre_aes_core` (qui traite cet identifiant comme un blob opaque)
-   ni de `chiffre-rsa-core` (qui calcule l'empreinte sans savoir à quoi
-   elle sert).
-3. Délègue l'écriture du fichier à
-   `chiffre_aes_core::encrypt_file_with_raw_key`.
+1. Génère une clé de contenu (CEK) aléatoire (`RawKey::generate_random()`).
+2. La scelle pour chaque destinataire (`RsaPublicKey::wrap_key`), avec
+   comme `recipient_id` l'empreinte SHA-256 de sa clé publique — choix de
+   ce crate, voir `FORMAT.md` §1.
+3. Délègue l'écriture à `chiffre_aes_core`, qui fait signer le fichier
+   par `sender` (RSA-PSS sur l'empreinte du fichier, préfixée — voir
+   `FORMAT.md` §2.1).
 
-## Déchiffrement (`decrypt_file_with_key`)
+## Déchiffrement
 
-1. Inspecte le header via `chiffre_aes_core::inspect_key_requirement`
-   (ne nécessite pas encore la clé privée).
-2. Si le fichier attend un mot de passe (`HeaderKeyRequirement::Password`)
-   plutôt qu'une clé externe → `EnvelopeError::NotEncryptedForKey`.
-3. Sinon, cherche parmi les entrées listées celle dont `recipient_id`
-   correspond à l'empreinte de `key` → `EnvelopeError::RecipientNotFound`
-   si aucune ne correspond. **Ne tente jamais un descellement à
-   l'aveugle** sur une entrée qui ne correspond pas : ce serait à la fois
-   inutile et producteur d'une erreur RSA (`UnwrapFailed`) moins
-   informative qu'un `RecipientNotFound` explicite.
-4. Descelle la CEK (`RsaKeyPair::unwrap_key`) et délègue le déchiffrement
-   à `chiffre_aes_core::decrypt_file_with_raw_key`.
+1. Lit l'en-tête sans secret ; un fichier chiffré par mot de passe →
+   `NotEncryptedForKey`.
+2. Cherche l'entrée dont `recipient_id` correspond à l'empreinte de `key`
+   → `RecipientNotFound` sinon. **Jamais de descellement à l'aveugle.**
+3. Descelle la CEK, puis `chiffre_aes_core` vérifie l'engagement de clé et
+   la signature : accepté seulement si l'expéditeur est l'une des clés de
+   `expected_senders` (sinon `SenderNotVerified`, rien n'est livré). La
+   fonction renvoie l'empreinte de l'expéditeur vérifié.
 
-# Archives multi-fichiers (`encrypt_paths_for_recipients`/`decrypt_paths_with_key`)
+# Archives multi-fichiers
 
-Combine `chiffre_aes_core::archive::build_archive`/`extract_archive`
-(déjà utilisé pour la voie mot de passe par
-`chiffre_aes_core::pipeline`, mais jamais câblé pour la voie RSA avant
-ce crate) avec les mêmes primitives RSA que la voie mono-fichier. Un seul
-fichier n'est qu'un cas particulier de `selected_paths` à un élément —
-pas de logique dupliquée entre les deux voies au-delà de ce qui est
-inhérent à l'archivage.
+Confiées à `chiffre_aes_core::encrypt_paths_for_recipients` /
+`decrypt_to_dir_from_sender` : archive intermédiaire chiffrée sous une
+clé éphémère (plus aucun clair sur disque, contrairement aux versions
+1.x), extraction seulement après vérification complète, dossier
+temporaire privé, aucun écrasement, écriture durable. Voir `FORMAT.md`
+§5.2.
 
 ## Métadonnées optionnelles injectées par l'application
 
-Deux fichiers réservés, **injectés par l'application** (pas par ce
-crate — il archive simplement ce qu'on lui donne dans `selected_paths`,
-sans traitement spécial pour ces noms) dans le dossier temporaire avant
-l'appel, voir `FORMAT.md` §5.1 :
+Deux fichiers réservés, **injectés par l'application** dans
+`selected_paths` (ce crate les archive tels quels), voir `FORMAT.md` §5.1 :
 
 | Fichier | Contenu | Visible par |
 |---|---|---|
 | `_expediteur.json` | Document de clé signé de l'expéditeur (`chiffre-rsa-keystore`) | Uniquement les destinataires (dans le contenu chiffré) |
 | `_destinataires.json` | Liste `[{ firstname, lastname, organisation, fingerprint }, ...]`, incluant l'expéditeur | Idem — effet "liste CC" voulu, pas une fuite |
 
-Ces deux inclusions sont des choix de l'application, indépendants l'un de
-l'autre. **Collision de nom** : `encrypt_paths_for_recipients` détecte
-et refuse (`EnvelopeError::DuplicateArchiveEntryName`) toute paire de
-chemins de `selected_paths` qui produirait la même entrée d'archive —
-vérification générale, qui couvre ce cas sans traitement spécial des
-deux noms réservés ; voir `FORMAT.md` §5.4 pour ce qu'elle ne couvre
-**pas** (un seul fichier, par erreur nommé `_expediteur.json`, sans
-collision réelle).
-
-## Atomicité de l'extraction
-
-`decrypt_paths_with_key` désarchive **toujours** d'abord vers un dossier
-temporaire sœur de `destination_dir`, jamais directement dedans. Bascule
-finale : `rename` unique si `destination_dir` n'existe pas encore ;
-déplacement entrée par entrée **en deux passes** (validation intégrale,
-puis déplacement seulement si aucune collision) si `destination_dir`
-existe déjà — une collision détectée retourne
-`EnvelopeError::DestinationConflict` sans rien déplacer. Voir `FORMAT.md`
-§5.2 pour le détail, y compris la limite restante assumée (pas de
-verrou inter-processus entre les deux passes).
+**Collision de nom** : deux chemins qui produiraient la même entrée
+d'archive sont refusés (`DuplicateArchiveEntryName`) — voir `FORMAT.md`
+§5.4, y compris ce que cette vérification ne couvre pas.
 
 # Ce que ce crate ne fait pas
 
 - Pas de vérification de confiance sur les clés publiques (voir
-  ci-dessus) — c'est `chiffre-rsa-keystore` + l'application appelante.
-- Pas de gestion de plusieurs "tentatives" de clé privée : `decrypt_file_with_key`
-  prend **une seule** `RsaKeyPair`. Un appelant qui possède plusieurs
-  clés privées candidates doit les essayer lui-même (ou d'abord regarder
-  les `recipient_id` via `chiffre_aes_core::inspect_key_requirement`
-  directement pour savoir laquelle utiliser sans essai-erreur).
-- Pas de renouvellement/révocation de destinataire sur un fichier déjà
-  chiffré : ajouter/retirer un destinataire nécessite de rechiffrer le
-  fichier entier (nouvelle CEK, nouveau `encrypt_file_for_recipients`) —
-  cohérent avec le hors-périmètre v1 du cahier des charges (pas de
-  rotation de clé).
+  ci-dessus).
+- Pas de fraîcheur : un fichier signé reste valide et peut être renvoyé
+  tel quel ; une date ou un numéro de version relèvent du contenu.
+- Pas de gestion de plusieurs clés privées candidates : `inspect_file`
+  donne les empreintes des destinataires pour choisir la bonne.
+- Pas d'ajout ou de retrait de destinataire sur un fichier existant : il
+  faut le rechiffrer.
 
 # Tests
 
-`src/lib.rs`, module `tests` : aller-retour mono-destinataire,
-aller-retour multi-destinataires (chaque destinataire peut déchiffrer
-indépendamment), rejet d'une clé qui n'est pas destinataire, rejet d'une
-liste de destinataires vide, rejet d'un fichier chiffré par mot de passe
-présenté à `decrypt_file_with_key`.
+`src/lib.rs`, module `tests` : allers-retours (fichier, mémoire,
+archives ; un ou plusieurs destinataires), expéditeur vérifié renvoyé,
+refus d'un expéditeur non attendu, d'une empreinte usurpée et d'une
+signature faite pour un autre usage (sans le préfixe), sans aucune sortie
+ni temporaire ; clé non destinataire, listes vides, fichier chiffré par
+mot de passe, collisions de noms et de destination.
 
 ```bash
-cargo test
+cargo test --release   # génération RSA-4096 : bien plus rapide en release
 ```
 
 ## Fuzzing
@@ -169,9 +131,9 @@ cargo test
 Voir [fuzz/](./fuzz/) et [FORMAT.md](./FORMAT.md) §6. Quatre cibles :
 
 - `decrypt_file_with_key` — contenu de fichier `.enc` arbitraire, clé
-  privée fixe. Couvre la combinaison `inspect_key_requirement` →
-  correspondance `recipient_id` → `unwrap_key`, propre à ce crate (ni
-  `chiffre_aes_core` ni `chiffre-rsa-core` ne l'exercent seuls).
+  privée fixe (seule expéditrice attendue). Couvre la combinaison lecture
+  de l'en-tête → correspondance `recipient_id` → `unwrap_key` →
+  vérification de l'expéditeur, propre à ce crate.
 - `encrypt_decrypt_roundtrip` — test de propriété (pas de robustesse
   face à un attaquant) : contenu de fichier arbitraire chiffré puis
   déchiffré doit redonner exactement le même contenu (voie mono-fichier).
@@ -179,8 +141,7 @@ Voir [fuzz/](./fuzz/) et [FORMAT.md](./FORMAT.md) §6. Quatre cibles :
   via la voie archive multi-fichiers.
 - `encrypt_decrypt_paths_roundtrip` — même principe que
   `encrypt_decrypt_roundtrip`, mais à travers une vraie archive
-  multi-entrées (`build_archive`/`extract_archive`), pas seulement un
-  flux chiffré unique.
+  multi-entrées, pas seulement un flux chiffré unique.
 
 ```bash
 cargo +nightly fuzz run decrypt_file_with_key -- -max_total_time=120

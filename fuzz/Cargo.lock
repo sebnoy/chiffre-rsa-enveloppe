@@ -205,22 +205,8 @@ dependencies = [
 
 [[package]]
 name = "chiffre-rsa-core"
-version = "1.2.1"
-dependencies = [
- "chiffre_aes_core",
- "pkcs8",
- "rand_core 0.6.4",
- "rsa",
- "sha2 0.10.9",
- "spki",
- "thiserror 1.0.69",
- "zeroize",
-]
-
-[[package]]
-name = "chiffre-rsa-core"
-version = "1.2.1"
-source = "git+https://github.com/sebnoy/chiffre-rsa-core?tag=v1.2.1#777c406a838c5f38567a67e41baaa9ec13892681"
+version = "2.0.0"
+source = "git+https://github.com/sebnoy/chiffre-rsa-core?tag=v2.0.0#d37ee9d962bdb3c44264c139b327ac1c386ad16b"
 dependencies = [
  "chiffre_aes_core",
  "pkcs8",
@@ -234,19 +220,19 @@ dependencies = [
 
 [[package]]
 name = "chiffre-rsa-enveloppe"
-version = "1.1.1"
+version = "2.0.0"
 dependencies = [
- "chiffre-rsa-core 1.2.1 (git+https://github.com/sebnoy/chiffre-rsa-core?tag=v1.2.1)",
+ "chiffre-rsa-core",
  "chiffre_aes_core",
- "tempfile",
  "thiserror 1.0.69",
+ "zeroize",
 ]
 
 [[package]]
 name = "chiffre-rsa-enveloppe-fuzz"
 version = "0.0.0"
 dependencies = [
- "chiffre-rsa-core 1.2.1",
+ "chiffre-rsa-core",
  "chiffre-rsa-enveloppe",
  "libfuzzer-sys",
  "tempfile",
@@ -254,14 +240,17 @@ dependencies = [
 
 [[package]]
 name = "chiffre_aes_core"
-version = "2.1.1"
-source = "git+https://github.com/sebnoy/chiffre-aes-core?tag=v2.1.1#f6786942b421fe292d73357113958fed50adbf18"
+version = "3.0.0"
+source = "git+https://github.com/sebnoy/chiffre-aes-core?tag=v3.0.0#d5d93ab0564887f8b73a19a114bcea54062bee44"
 dependencies = [
  "aes-gcm",
  "argon2",
  "flate2",
+ "hkdf",
  "rand 0.10.2",
+ "rustix",
  "sha2 0.11.0",
+ "subtle",
  "tempfile",
  "thiserror 2.0.20",
  "zeroize",
@@ -502,6 +491,7 @@ dependencies = [
  "block-buffer 0.12.1",
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
+ "ctutils",
 ]
 
 [[package]]
@@ -626,12 +616,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac 0.13.0",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -856,7 +864,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
 dependencies = [
  "digest 0.10.7",
- "hmac",
+ "hmac 0.12.1",
 ]
 
 [[package]]

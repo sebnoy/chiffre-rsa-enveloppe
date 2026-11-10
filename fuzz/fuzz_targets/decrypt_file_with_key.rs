@@ -57,5 +57,7 @@ fuzz_target!(|data: &[u8]| {
     }
     drop(f);
 
-    let _ = chiffre_rsa_enveloppe::decrypt_file_with_key(&enc_path, &out_path, fixed_key());
+    let expected = [fixed_key().public_key()];
+    let _ =
+        chiffre_rsa_enveloppe::decrypt_file_with_key(&enc_path, &out_path, fixed_key(), &expected);
 });

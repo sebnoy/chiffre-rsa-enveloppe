@@ -26,6 +26,7 @@ fn main() {
         &[RecipientRef {
             public_key: &public_key,
         }],
+        &key_pair,
     )
     .expect("chiffrement");
 

@@ -1,39 +1,64 @@
 //! `chiffre-rsa-enveloppe` — orchestration multi-destinataires : produit
-//! ou lit un fichier `.enc` complet en combinant `chiffre-rsa-core`
-//! (scellement/descellement RSA-OAEP de la clé de contenu) et
-//! `chiffre_aes_core` (format de fichier, chiffrement symétrique). Voir le
-//! cahier des charges, Partie 2 §4.
+//! ou lit un fichier `.enc` complet (format v3 de `chiffre_aes_core`) en
+//! combinant `chiffre-rsa-core` (scellement RSA-OAEP de la clé de contenu,
+//! signature RSA-PSS de l'expéditeur) et `chiffre_aes_core` (format,
+//! chiffrement symétrique, engagement de clé). Voir `FORMAT.md`.
 //!
-//! Ce crate ne connaît jamais de métadonnées ni de format JSON de
-//! confiance (§6 du cahier des charges) — c'est `chiffre-rsa-keystore`
-//! qui en aura la responsabilité, et l'application appelante qui décide,
-//! après lecture d'un rapport de classification, en qui elle a confiance
-//! avant de construire un `RecipientRef`.
+//! **Chaque fichier est signé par son expéditeur**, et le déchiffrement exige
+//! la liste des expéditeurs attendus : un fichier signé par une autre clé est
+//! refusé ([`EnvelopeError::SenderNotVerified`]) sans qu'aucun clair ne soit
+//! livré.
+//!
+//! Ce crate ne décide jamais de la confiance : c'est l'application qui
+//! choisit les clés publiques des destinataires ([`RecipientRef`]) et des
+//! expéditeurs attendus, après sa propre vérification (par exemple avec
+//! `chiffre-rsa-keystore`).
 
+use std::cell::Cell;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Version de ce crate (`Cargo.toml`) 
+use chiffre_aes_core::{
+    ArchiveError, ArchiveWarning, ExtractionLimits, FormatError, PipelineError, RawKey, Recipient,
+    RecipientsInfo, SenderSigner, SenderVerifier,
+};
+use chiffre_rsa_core::{RsaKeyPair, RsaKeysError, RsaPublicKey};
+use zeroize::Zeroizing;
+
+/// Version de ce crate (`Cargo.toml`)
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-use chiffre_aes_core::{ArchiveWarning, HeaderKeyRequirement, RawKey, Recipient};
-use chiffre_rsa_core::{RsaKeyPair, RsaKeysError, RsaPublicKey};
+/// Empreinte SHA-256 d'une clé publique ([`RsaPublicKey::fingerprint`]).
+pub type Fingerprint = [u8; 32];
+
+/// Préfixe du message signé en RSA-PSS : la même clé RSA peut signer
+/// d'autres documents dans l'application (messages, répertoires) ; ce
+/// préfixe empêche qu'une signature de fichier serve ailleurs, ou
+/// l'inverse.
+const SIGNATURE_DOMAIN: &[u8] = b"chiffre-rsa-enveloppe v2 signature de l'expediteur\0";
 
 #[derive(Debug, thiserror::Error)]
 pub enum EnvelopeError {
     #[error("aucun destinataire fourni")]
     NoRecipients,
+    #[error("aucun expéditeur attendu fourni")]
+    NoExpectedSenders,
     #[error("ce fichier a été chiffré avec un mot de passe, pas pour une clé RSA")]
     NotEncryptedForKey,
     #[error(
         "aucune entrée de destinataire de ce fichier ne correspond à l'empreinte de cette clé privée"
     )]
     RecipientNotFound,
+    #[error(
+        "expéditeur non vérifié : fichier signé par une clé non attendue, ou signature invalide"
+    )]
+    SenderNotVerified,
     #[error("erreur de format/chiffrement sous-jacent : {0}")]
-    Format(#[from] chiffre_aes_core::FormatError),
+    Format(#[from] FormatError),
     #[error("erreur RSA sous-jacente : {0}")]
     RsaKeys(#[from] RsaKeysError),
     #[error("erreur d'archivage sous-jacente : {0}")]
-    Archive(#[from] chiffre_aes_core::ArchiveError),
+    Archive(#[from] ArchiveError),
     #[error("erreur système : {0}")]
     Io(#[from] std::io::Error),
     #[error("chemin sélectionné sans nom de fichier exploitable : {0}")]
@@ -43,140 +68,249 @@ pub enum EnvelopeError {
          l'un écraserait l'autre silencieusement à l'extraction"
     )]
     DuplicateArchiveEntryName(String),
-    #[error("« {0} » existe déjà dans le dossier de destination")]
+    #[error("{0}")]
     DestinationConflict(String),
 }
 
-/// Un destinataire pour [`encrypt_file_for_recipients`] : simple référence
-/// vers une clé publique **déjà jugée de confiance par l'application
-/// appelante**. Ce crate ne fait aucune vérification de confiance
-/// lui-même — voir le cahier des charges §2 (tableau des interfaces) :
-/// `chiffre-rsa-keystore` ne transmet jamais rien directement ici, c'est
-/// toujours l'application qui fait le pont après une décision humaine.
+/// Un destinataire : référence vers une clé publique **déjà jugée de
+/// confiance par l'application appelante**.
 pub struct RecipientRef<'a> {
     pub public_key: &'a RsaPublicKey,
 }
 
-/// Chiffre `input` pour l'ensemble des `recipients` fournis, en écrivant
-/// un fichier `.enc` v2 (`key_source = 1`, destinataires externes) vers
-/// `output`.
-///
-/// Génère une clé de contenu (CEK) aléatoire, la scelle une fois par
-/// destinataire (RSA-OAEP, via `chiffre-rsa-core`), et délègue l'écriture
-/// du fichier à `chiffre_aes_core::encrypt_file_with_raw_key` — un seul
-/// destinataire n'est qu'un cas particulier de N, pas de chemin de code
-/// séparé.
-///
-/// L'identifiant de destinataire (`recipient_id`) stocké dans le header
-/// est l'empreinte SHA-256 de la clé publique
-/// ([`RsaPublicKey::fingerprint`]) : c'est un choix de ce crate, pas de
-/// `chiffre_aes_core` (qui traite cet identifiant comme un blob opaque) ni
-/// de `chiffre-rsa-core` (qui calcule l'empreinte mais ne décide pas de
-/// son usage). C'est ce même choix que [`decrypt_file_with_key`] suppose
-/// pour retrouver la bonne entrée.
+/// Ce que l'en-tête d'un fichier révèle sans aucun secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvelopeInfo {
+    /// Empreinte annoncée de la clé de l'expéditeur (non vérifiée tant que
+    /// le fichier n'est pas déchiffré).
+    pub sender_fingerprint: Vec<u8>,
+    /// Empreintes des clés publiques des destinataires.
+    pub recipient_fingerprints: Vec<Vec<u8>>,
+}
+
+// ============================================================================
+// Signature et vérification de l'expéditeur
+// ============================================================================
+
+fn signed_message(transcript: &[u8; 32]) -> Vec<u8> {
+    [SIGNATURE_DOMAIN, transcript.as_slice()].concat()
+}
+
+struct RsaSigner<'a>(&'a RsaKeyPair);
+
+impl SenderSigner for RsaSigner<'_> {
+    fn sender_id(&self) -> Vec<u8> {
+        self.0.public_key().fingerprint().to_vec()
+    }
+    fn sign(&self, transcript: &[u8; 32]) -> Vec<u8> {
+        self.0.sign(&signed_message(transcript))
+    }
+}
+
+/// N'accepte qu'une clé de `expected`, et retient laquelle (ou le refus,
+/// pour rapporter [`EnvelopeError::SenderNotVerified`] plutôt qu'une
+/// corruption générique).
+struct RsaVerifier<'a> {
+    expected: &'a [RsaPublicKey],
+    verified: Cell<Option<Fingerprint>>,
+    refused: Cell<bool>,
+}
+
+impl<'a> RsaVerifier<'a> {
+    fn new(expected: &'a [RsaPublicKey]) -> Result<Self, EnvelopeError> {
+        if expected.is_empty() {
+            return Err(EnvelopeError::NoExpectedSenders);
+        }
+        Ok(Self {
+            expected,
+            verified: Cell::new(None),
+            refused: Cell::new(false),
+        })
+    }
+
+    /// Traduit le résultat du format en expéditeur vérifié.
+    fn outcome(&self, result: Result<(), FormatError>) -> Result<Fingerprint, EnvelopeError> {
+        match result {
+            Ok(()) => self.verified.get().ok_or(EnvelopeError::SenderNotVerified),
+            Err(FormatError::Corrupted) if self.refused.get() => {
+                Err(EnvelopeError::SenderNotVerified)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl SenderVerifier for RsaVerifier<'_> {
+    fn verify(&self, sender_id: &[u8], transcript: &[u8; 32], signature: &[u8]) -> bool {
+        let accepted = self.expected.iter().find_map(|key| {
+            let fingerprint = key.fingerprint();
+            (fingerprint.as_slice() == sender_id
+                && key.verify(&signed_message(transcript), signature).is_ok())
+            .then_some(fingerprint)
+        });
+        self.verified.set(accepted);
+        self.refused.set(accepted.is_none());
+        accepted.is_some()
+    }
+}
+
+// ============================================================================
+// Clé de contenu : scellement et descellement
+// ============================================================================
+
+/// Génère une clé de contenu et la scelle (RSA-OAEP) pour chaque
+/// destinataire, identifié par l'empreinte de sa clé publique.
+fn seal(recipients: &[RecipientRef]) -> Result<(RawKey, Vec<Recipient>), EnvelopeError> {
+    if recipients.is_empty() {
+        return Err(EnvelopeError::NoRecipients);
+    }
+    let cek = RawKey::generate_random();
+    let sealed = recipients
+        .iter()
+        .map(|r| {
+            Ok(Recipient {
+                recipient_id: r.public_key.fingerprint().to_vec(),
+                wrapped_key: r.public_key.wrap_key(&cek)?,
+            })
+        })
+        .collect::<Result<Vec<_>, EnvelopeError>>()?;
+    Ok((cek, sealed))
+}
+
+/// Retrouve l'entrée qui correspond à `key` (par empreinte, jamais à
+/// l'aveugle) et descelle la clé de contenu.
+fn unseal(info: &RecipientsInfo, key: &RsaKeyPair) -> Result<RawKey, EnvelopeError> {
+    let fingerprint = key.public_key().fingerprint();
+    let entry = info
+        .recipients
+        .iter()
+        .find(|r| r.recipient_id.as_slice() == fingerprint.as_slice())
+        .ok_or(EnvelopeError::RecipientNotFound)?;
+    Ok(key.unwrap_key(&entry.wrapped_key)?)
+}
+
+/// Un fichier v1 (mot de passe) est signalé comme tel plutôt que comme un
+/// en-tête invalide.
+fn reject_password_container(start: &[u8]) -> Result<(), EnvelopeError> {
+    if start.len() >= 5 && &start[..4] == b"ENC1" && start[4] == 1 {
+        return Err(EnvelopeError::NotEncryptedForKey);
+    }
+    Ok(())
+}
+
+fn recipients_of_file(input: &Path) -> Result<RecipientsInfo, EnvelopeError> {
+    let mut start = Vec::with_capacity(5);
+    std::fs::File::open(input)?
+        .take(5)
+        .read_to_end(&mut start)?;
+    reject_password_container(&start)?;
+    Ok(chiffre_aes_core::inspect_recipients(input)?)
+}
+
+fn recipients_of_bytes(container: &[u8]) -> Result<RecipientsInfo, EnvelopeError> {
+    reject_password_container(container)?;
+    Ok(chiffre_aes_core::inspect_recipients_bytes(container)?)
+}
+
+fn envelope_info(info: RecipientsInfo) -> EnvelopeInfo {
+    EnvelopeInfo {
+        sender_fingerprint: info.sender_id,
+        recipient_fingerprints: info
+            .recipients
+            .into_iter()
+            .map(|r| r.recipient_id)
+            .collect(),
+    }
+}
+
+/// Lit l'en-tête d'un fichier sans secret : expéditeur annoncé et
+/// destinataires.
+pub fn inspect_file(input: &Path) -> Result<EnvelopeInfo, EnvelopeError> {
+    Ok(envelope_info(recipients_of_file(input)?))
+}
+
+/// Identique à [`inspect_file`], pour un conteneur en mémoire.
+pub fn inspect_bytes(container: &[u8]) -> Result<EnvelopeInfo, EnvelopeError> {
+    Ok(envelope_info(recipients_of_bytes(container)?))
+}
+
+// ============================================================================
+// Fichiers
+// ============================================================================
+
+/// Chiffre `input` pour `recipients`, signé par `sender`, vers `output`.
 pub fn encrypt_file_for_recipients(
     input: &Path,
     output: &Path,
     recipients: &[RecipientRef],
+    sender: &RsaKeyPair,
 ) -> Result<(), EnvelopeError> {
-    if recipients.is_empty() {
-        return Err(EnvelopeError::NoRecipients);
-    }
-
-    let cek = RawKey::generate_random();
-
-    let mut sealed_recipients = Vec::with_capacity(recipients.len());
-    for recipient in recipients {
-        let wrapped_key = recipient.public_key.wrap_key(&cek)?;
-        let recipient_id = recipient.public_key.fingerprint().to_vec();
-        sealed_recipients.push(Recipient {
-            recipient_id,
-            wrapped_key,
-        });
-    }
-
-    chiffre_aes_core::encrypt_file_with_raw_key(input, output, cek, &sealed_recipients)?;
+    let (cek, sealed) = seal(recipients)?;
+    chiffre_aes_core::encrypt_file_for_recipients(input, output, cek, &sealed, &RsaSigner(sender))?;
     Ok(())
 }
 
-/// Déchiffre `input` (fichier `.enc` v2, destinataires externes) avec
-/// `key`, en écrivant le résultat vers `output`.
-///
-/// Inspecte d'abord le header (sans avoir besoin de `key` pour cela, voir
-/// [`chiffre_aes_core::inspect_key_requirement`]) pour retrouver, parmi
-/// les destinataires listés, celui dont `recipient_id` correspond à
-/// l'empreinte de `key` — c'est le même appariement par empreinte que
-/// [`encrypt_file_for_recipients`] a produit à l'écriture. Ne tente
-/// **jamais** un descellement à l'aveugle sur une entrée qui ne
-/// correspond pas : outre l'inefficacité, ça produirait une erreur RSA
-/// (`UnwrapFailed`) moins informative que [`EnvelopeError::RecipientNotFound`].
+/// Déchiffre `input` avec `key` vers `output`, à condition qu'il soit signé
+/// par l'une des clés de `expected_senders`. Renvoie l'empreinte de
+/// l'expéditeur vérifié. Rien n'est écrit à `output` en cas de refus.
 pub fn decrypt_file_with_key(
     input: &Path,
     output: &Path,
     key: &RsaKeyPair,
-) -> Result<(), EnvelopeError> {
-    let requirement = chiffre_aes_core::inspect_key_requirement(input)?;
-
-    let recipients = match requirement {
-        HeaderKeyRequirement::Password => return Err(EnvelopeError::NotEncryptedForKey),
-        HeaderKeyRequirement::ExternalKey { recipients } => recipients,
-    };
-
-    let our_fingerprint = key.public_key().fingerprint();
-    let entry = recipients
-        .iter()
-        .find(|entry| entry.recipient_id.as_slice() == our_fingerprint.as_slice())
-        .ok_or(EnvelopeError::RecipientNotFound)?;
-
-    let cek = key.unwrap_key(&entry.wrapped_key)?;
-    chiffre_aes_core::decrypt_file_with_raw_key(input, output, cek)?;
-    Ok(())
+    expected_senders: &[RsaPublicKey],
+) -> Result<Fingerprint, EnvelopeError> {
+    let verifier = RsaVerifier::new(expected_senders)?;
+    let cek = unseal(&recipients_of_file(input)?, key)?;
+    verifier.outcome(chiffre_aes_core::decrypt_file_from_sender(
+        input, output, cek, &verifier,
+    ))
 }
 
-/// Détermine le dossier dans lequel créer un fichier/dossier temporaire
-/// pour une opération touchant `path` — le même dossier que `path`
-/// lui-même quand c'est possible, pour garantir un `rename` atomique sur
-/// le même système de fichiers ensuite (même principe que
-/// `chiffre_aes_core::format::create_tmp_path`, qui n'est pas
-/// accessible depuis ce crate — `pub(crate)` côté `chiffre_aes_core`).
-fn sibling_dir_of(path: &Path) -> &Path {
-    path.parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
+// ============================================================================
+// Mémoire : aucun fichier temporaire, aucun clair sur disque
+// ============================================================================
+
+/// Chiffre `plaintext` en mémoire pour `recipients`, signé par `sender`.
+pub fn encrypt_bytes_for_recipients(
+    plaintext: &[u8],
+    recipients: &[RecipientRef],
+    sender: &RsaKeyPair,
+) -> Result<Vec<u8>, EnvelopeError> {
+    let (cek, sealed) = seal(recipients)?;
+    Ok(chiffre_aes_core::encrypt_bytes_for_recipients(
+        plaintext,
+        cek,
+        &sealed,
+        &RsaSigner(sender),
+    )?)
 }
 
-/// Chiffre `selected_paths` (fichiers et/ou dossiers) pour l'ensemble des
-/// `recipients` fournis, en une archive multi-fichiers chiffrée — voir
-/// `FORMAT.md` §6. Un seul fichier n'est qu'un cas particulier de
-/// `selected_paths` à un seul élément : pas de fonction séparée pour ce
-/// cas (contrairement à [`encrypt_file_for_recipients`], gardée telle
-/// quelle pour l'usage simple mono-fichier sans dépendance à
-/// `chiffre_aes_core::archive`).
-///
-/// L'archive intermédiaire (avant chiffrement) est construite dans un
-/// fichier temporaire, sœur de `output` (même dossier), supprimé
-/// automatiquement en fin d'opération — y compris en cas d'erreur — via
-/// `tempfile::NamedTempFile`.
-///
-/// Retourne les avertissements non bloquants survenus lors de l'archivage
-/// (éléments ignorés — liens symboliques, chemins non-UTF8, etc., voir
-/// `chiffre_aes_core::archive`).
-/// Vérifie qu'aucun couple de chemins dans `selected_paths` ne
-/// produirait la même entrée dans l'archive (même
-/// `Path::file_name()`) — sinon l'un écraserait l'autre silencieusement
-/// à l'extraction, un comportement que `chiffre_aes_core::archive`
-/// (construit pour un seul appelant cohérent, pas pour détecter les
-/// doublons d'un appelant tiers) ne garantit pas.
-///
-/// Couvre, sans cas spécial, la collision entre un fichier de contenu
-/// réel et une métadonnée réservée (`_expediteur.json`/
-/// `_destinataires.json`, voir `FORMAT.md` §5.1) si l'application les
-/// inclut toutes les deux sous le même nom par erreur — c'est un cas
-/// particulier de cette vérification générale, pas un traitement séparé
-/// des deux noms réservés.
-fn check_no_duplicate_archive_entry_names(
-    selected_paths: &[PathBuf],
-) -> Result<(), EnvelopeError> {
+/// Déchiffre un conteneur en mémoire, à condition qu'il soit signé par l'une
+/// des clés de `expected_senders`. Renvoie le clair (effacé à sa
+/// destruction) et l'empreinte de l'expéditeur vérifié.
+pub fn decrypt_bytes_with_key(
+    container: &[u8],
+    key: &RsaKeyPair,
+    expected_senders: &[RsaPublicKey],
+) -> Result<(Zeroizing<Vec<u8>>, Fingerprint), EnvelopeError> {
+    let verifier = RsaVerifier::new(expected_senders)?;
+    let cek = unseal(&recipients_of_bytes(container)?, key)?;
+    let mut plaintext = None;
+    let sender = verifier.outcome(
+        chiffre_aes_core::decrypt_bytes_from_sender(container, cek, &verifier)
+            .map(|p| plaintext = Some(p)),
+    )?;
+    Ok((plaintext.expect("rempli en cas de succès"), sender))
+}
+
+// ============================================================================
+// Archives multi-fichiers
+// ============================================================================
+
+/// Deux chemins de même nom produiraient la même entrée d'archive.
+/// `chiffre_aes_core` le refuse aussi ; ce contrôle préalable donne une
+/// erreur précise, avant tout accès au fichier de sortie.
+fn check_no_duplicate_archive_entry_names(selected_paths: &[PathBuf]) -> Result<(), EnvelopeError> {
     let mut seen = std::collections::HashSet::new();
     for path in selected_paths {
         let name = path
@@ -191,132 +325,67 @@ fn check_no_duplicate_archive_entry_names(
     Ok(())
 }
 
+fn pipeline_error(e: PipelineError) -> EnvelopeError {
+    match e {
+        PipelineError::Format(f) => f.into(),
+        PipelineError::Archive(ArchiveError::Io(io))
+            if io.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            EnvelopeError::DestinationConflict(io.to_string())
+        }
+        PipelineError::Archive(a) => a.into(),
+    }
+}
+
+/// Chiffre `selected_paths` (fichiers et/ou dossiers) pour `recipients`,
+/// signé par `sender`, en une archive. L'archive intermédiaire est chiffrée
+/// sous une clé éphémère (aucun clair sur disque) et la sortie est écrite de
+/// façon durable (voir `chiffre_aes_core::encrypt_paths_for_recipients`).
 pub fn encrypt_paths_for_recipients(
     selected_paths: &[PathBuf],
     output: &Path,
     recipients: &[RecipientRef],
+    sender: &RsaKeyPair,
 ) -> Result<Vec<ArchiveWarning>, EnvelopeError> {
-    if recipients.is_empty() {
-        return Err(EnvelopeError::NoRecipients);
-    }
     check_no_duplicate_archive_entry_names(selected_paths)?;
-
-    let tmp_archive = tempfile::NamedTempFile::new_in(sibling_dir_of(output))?;
-    let warnings = {
-        let mut writer = std::io::BufWriter::new(tmp_archive.as_file());
-        let (_, warnings) = chiffre_aes_core::archive::build_archive(selected_paths, &mut writer)?;
-        std::io::Write::flush(&mut writer)?;
-        warnings
-    };
-
-    let cek = RawKey::generate_random();
-    let mut sealed_recipients = Vec::with_capacity(recipients.len());
-    for recipient in recipients {
-        let wrapped_key = recipient.public_key.wrap_key(&cek)?;
-        let recipient_id = recipient.public_key.fingerprint().to_vec();
-        sealed_recipients.push(Recipient {
-            recipient_id,
-            wrapped_key,
-        });
-    }
-
-    chiffre_aes_core::encrypt_file_with_raw_key(tmp_archive.path(), output, cek, &sealed_recipients)?;
-    // `tmp_archive` est supprimé ici, à la sortie de portée (RAII) —
-    // qu'on soit arrivés jusque là ou sortis plus tôt via `?`.
-    Ok(warnings)
+    let (cek, sealed) = seal(recipients)?;
+    chiffre_aes_core::encrypt_paths_for_recipients(
+        selected_paths,
+        output,
+        cek,
+        &sealed,
+        &RsaSigner(sender),
+        &mut |_| true,
+    )
+    .map_err(pipeline_error)
 }
 
-/// Déchiffre `input` (produit par [`encrypt_paths_for_recipients`]) et
-/// restitue les fichiers/dossiers d'origine sous `destination_dir`.
-///
-/// Toujours désarchivé d'abord vers un dossier temporaire sœur de
-/// `destination_dir`, jamais directement dedans — que `destination_dir`
-/// existe déjà ou non. Si `destination_dir` n'existe pas encore : bascule
-/// par un simple `rename` du dossier temporaire entier. Si
-/// `destination_dir` existe déjà : déplacement entrée par entrée, en
-/// deux passes — d'abord vérifier qu'aucune entrée ne collisionne avec
-/// un élément déjà présent (auquel cas [`EnvelopeError::DestinationConflict`],
-/// **rien n'est déplacé**), puis déplacer seulement si tout est propre.
-/// Dans les deux cas, une erreur en cours d'extraction (avant la bascule)
-/// ne laisse jamais `destination_dir` dans un état partiellement écrit.
+/// Déchiffre une archive produite par [`encrypt_paths_for_recipients`] vers
+/// `destination_dir`, à condition qu'elle soit signée par l'une des clés de
+/// `expected_senders`. Rien n'est extrait avant la vérification complète ;
+/// un élément déjà présent à la destination fait échouer l'opération sans
+/// rien déplacer ([`EnvelopeError::DestinationConflict`]).
 pub fn decrypt_paths_with_key(
     input: &Path,
     destination_dir: &Path,
     key: &RsaKeyPair,
-) -> Result<Vec<ArchiveWarning>, EnvelopeError> {
-    let requirement = chiffre_aes_core::inspect_key_requirement(input)?;
-
-    let recipients = match requirement {
-        HeaderKeyRequirement::Password => return Err(EnvelopeError::NotEncryptedForKey),
-        HeaderKeyRequirement::ExternalKey { recipients } => recipients,
-    };
-
-    let our_fingerprint = key.public_key().fingerprint();
-    let entry = recipients
-        .iter()
-        .find(|entry| entry.recipient_id.as_slice() == our_fingerprint.as_slice())
-        .ok_or(EnvelopeError::RecipientNotFound)?;
-    let cek = key.unwrap_key(&entry.wrapped_key)?;
-
-    let tmp_archive = tempfile::NamedTempFile::new_in(sibling_dir_of(input))?;
-    chiffre_aes_core::decrypt_file_with_raw_key(input, tmp_archive.path(), cek)?;
-
-    let dest_parent = sibling_dir_of(destination_dir);
-    std::fs::create_dir_all(dest_parent)?;
-
-    let tmp_extract_dir = tempfile::Builder::new()
-        .prefix(".chiffre-rsa-enveloppe-extract-tmp-")
-        .rand_bytes(16)
-        .tempdir_in(dest_parent)?;
-
-    let warnings = {
-        let file = std::fs::File::open(tmp_archive.path())?;
-        let mut reader = std::io::BufReader::new(file);
-        chiffre_aes_core::archive::extract_archive(&mut reader, tmp_extract_dir.path())?
-    };
-
-    if destination_dir.exists() {
-        move_entries_into_existing_dir(tmp_extract_dir.path(), destination_dir)?;
-        // `tmp_extract_dir` est maintenant vide : nettoyage normal (Drop).
-    } else {
-        std::fs::rename(tmp_extract_dir.path(), destination_dir)?;
-        // Le contenu a été déplacé vers destination_dir : on désarme la
-        // suppression automatique via `keep()` plutôt que
-        // `std::mem::forget` (voir FORMAT.md §5.3 — bug de fuite mémoire
-        // déjà trouvé et corrigé sur exactement ce point).
-        let _ = tmp_extract_dir.keep();
+    expected_senders: &[RsaPublicKey],
+) -> Result<(Vec<ArchiveWarning>, Fingerprint), EnvelopeError> {
+    let verifier = RsaVerifier::new(expected_senders)?;
+    let cek = unseal(&recipients_of_file(input)?, key)?;
+    let result = chiffre_aes_core::decrypt_to_dir_from_sender(
+        input,
+        destination_dir,
+        cek,
+        &verifier,
+        ExtractionLimits::default(),
+        &mut |_| true,
+    );
+    match result {
+        Ok(warnings) => Ok((warnings, verifier.outcome(Ok(()))?)),
+        Err(PipelineError::Format(f)) => Err(verifier.outcome(Err(f)).unwrap_err()),
+        Err(e) => Err(pipeline_error(e)),
     }
-
-    Ok(warnings)
-}
-
-/// Déplace chaque entrée de premier niveau de `source_dir` vers
-/// `dest_dir` (qui existe déjà), en deux passes — voir la doc de
-/// [`decrypt_paths_with_key`] pour la garantie que ça apporte.
-fn move_entries_into_existing_dir(source_dir: &Path, dest_dir: &Path) -> Result<(), EnvelopeError> {
-    let entries: Vec<std::fs::DirEntry> =
-        std::fs::read_dir(source_dir)?.collect::<std::io::Result<Vec<_>>>()?;
-
-    // Passe 1 : validation seule, aucune écriture.
-    for entry in &entries {
-        let target = dest_dir.join(entry.file_name());
-        if target.exists() {
-            return Err(EnvelopeError::DestinationConflict(
-                target.display().to_string(),
-            ));
-        }
-    }
-
-    // Passe 2 : déplacement — plus aucune collision possible, sauf
-    // modification concurrente de `dest_dir` par un autre processus
-    // entre les deux passes (hors de portée de ce qu'une fonction
-    // synchrone peut garantir seule, sans verrouillage externe).
-    for entry in &entries {
-        let target = dest_dir.join(entry.file_name());
-        std::fs::rename(entry.path(), &target)?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -325,8 +394,8 @@ mod tests {
     use std::sync::OnceLock;
     use tempfile::tempdir;
 
-    // Génération RSA-4096 coûteuse (plusieurs secondes) : trois clés
-    // partagées entre tous les tests plutôt que régénérées à chaque fois.
+    // Génération RSA-4096 coûteuse (plusieurs secondes) : clés partagées
+    // entre tous les tests plutôt que régénérées à chaque fois.
     fn key_alice() -> &'static RsaKeyPair {
         static KEY: OnceLock<RsaKeyPair> = OnceLock::new();
         KEY.get_or_init(|| RsaKeyPair::generate().expect("génération clé Alice"))
@@ -339,170 +408,263 @@ mod tests {
 
     fn key_outsider() -> &'static RsaKeyPair {
         static KEY: OnceLock<RsaKeyPair> = OnceLock::new();
-        KEY.get_or_init(|| RsaKeyPair::generate().expect("génération clé tierce (non destinataire)"))
+        KEY.get_or_init(|| RsaKeyPair::generate().expect("génération clé tierce"))
+    }
+
+    /// Alice écrit, Alice est seule destinataire et seule expéditrice
+    /// attendue : le cas le plus simple.
+    fn alice_only() -> (RsaPublicKey, Vec<RsaPublicKey>) {
+        (key_alice().public_key(), vec![key_alice().public_key()])
     }
 
     #[test]
-    fn roundtrip_single_recipient() {
-        let dir = tempdir().expect("tempdir");
-        let input = dir.path().join("plain.txt");
-        let enc = dir.path().join("out.enc");
-        let decrypted = dir.path().join("decrypted.txt");
-
+    fn roundtrip_single_recipient_returns_verified_sender() {
+        let dir = tempdir().unwrap();
+        let (input, enc, out) = (
+            dir.path().join("plain.txt"),
+            dir.path().join("out.enc"),
+            dir.path().join("decrypted.txt"),
+        );
         std::fs::write(&input, b"Contenu secret pour Alice uniquement.").unwrap();
-
-        let alice_public = key_alice().public_key();
+        let (alice, expected) = alice_only();
         encrypt_file_for_recipients(
             &input,
             &enc,
-            &[RecipientRef {
-                public_key: &alice_public,
-            }],
+            &[RecipientRef { public_key: &alice }],
+            key_alice(),
         )
-        .expect("chiffrement");
+        .unwrap();
 
-        decrypt_file_with_key(&enc, &decrypted, key_alice()).expect("déchiffrement");
-
-        assert_eq!(
-            std::fs::read(&input).unwrap(),
-            std::fs::read(&decrypted).unwrap()
-        );
+        let sender = decrypt_file_with_key(&enc, &out, key_alice(), &expected).unwrap();
+        assert_eq!(sender, alice.fingerprint());
+        assert_eq!(std::fs::read(&input).unwrap(), std::fs::read(&out).unwrap());
     }
 
     #[test]
     fn roundtrip_multi_recipients_each_can_decrypt() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir().unwrap();
         let input = dir.path().join("plain.txt");
         let enc = dir.path().join("out.enc");
-
         std::fs::write(&input, b"Contenu partage entre Alice et Bob.").unwrap();
-
-        let alice_public = key_alice().public_key();
-        let bob_public = key_bob().public_key();
-
+        let (alice, bob) = (key_alice().public_key(), key_bob().public_key());
         encrypt_file_for_recipients(
             &input,
             &enc,
             &[
-                RecipientRef {
-                    public_key: &alice_public,
-                },
-                RecipientRef {
-                    public_key: &bob_public,
-                },
+                RecipientRef { public_key: &alice },
+                RecipientRef { public_key: &bob },
             ],
+            key_alice(),
         )
-        .expect("chiffrement multi-destinataires");
+        .unwrap();
 
-        let decrypted_alice = dir.path().join("decrypted_alice.txt");
-        decrypt_file_with_key(&enc, &decrypted_alice, key_alice())
-            .expect("déchiffrement par Alice");
-        assert_eq!(
-            std::fs::read(&input).unwrap(),
-            std::fs::read(&decrypted_alice).unwrap()
-        );
-
-        let decrypted_bob = dir.path().join("decrypted_bob.txt");
-        decrypt_file_with_key(&enc, &decrypted_bob, key_bob()).expect("déchiffrement par Bob");
-        assert_eq!(
-            std::fs::read(&input).unwrap(),
-            std::fs::read(&decrypted_bob).unwrap()
-        );
+        for (name, key) in [("alice", key_alice()), ("bob", key_bob())] {
+            let out = dir.path().join(name);
+            decrypt_file_with_key(&enc, &out, key, std::slice::from_ref(&alice)).unwrap();
+            assert_eq!(std::fs::read(&input).unwrap(), std::fs::read(&out).unwrap());
+        }
     }
 
     #[test]
     fn decrypt_with_non_recipient_key_fails_with_recipient_not_found() {
-        let dir = tempdir().expect("tempdir");
-        let input = dir.path().join("plain.txt");
-        let enc = dir.path().join("out.enc");
-        let decrypted = dir.path().join("decrypted.txt");
-
+        let dir = tempdir().unwrap();
+        let (input, enc) = (dir.path().join("plain.txt"), dir.path().join("out.enc"));
         std::fs::write(&input, b"Reserve a Alice.").unwrap();
-
-        let alice_public = key_alice().public_key();
+        let (alice, expected) = alice_only();
         encrypt_file_for_recipients(
             &input,
             &enc,
-            &[RecipientRef {
-                public_key: &alice_public,
-            }],
+            &[RecipientRef { public_key: &alice }],
+            key_alice(),
         )
-        .expect("chiffrement");
-
-        let result = decrypt_file_with_key(&enc, &decrypted, key_outsider());
+        .unwrap();
+        let result = decrypt_file_with_key(&enc, &dir.path().join("o"), key_outsider(), &expected);
         assert!(matches!(result, Err(EnvelopeError::RecipientNotFound)));
     }
 
     #[test]
     fn encrypt_with_no_recipients_fails() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir().unwrap();
         let input = dir.path().join("plain.txt");
-        let enc = dir.path().join("out.enc");
         std::fs::write(&input, b"peu importe").unwrap();
-
-        let result = encrypt_file_for_recipients(&input, &enc, &[]);
+        let result =
+            encrypt_file_for_recipients(&input, &dir.path().join("o.enc"), &[], key_alice());
         assert!(matches!(result, Err(EnvelopeError::NoRecipients)));
     }
 
     #[test]
+    fn decrypt_without_expected_senders_fails() {
+        let result = decrypt_bytes_with_key(b"", key_alice(), &[]);
+        assert!(matches!(result, Err(EnvelopeError::NoExpectedSenders)));
+    }
+
+    #[test]
     fn decrypt_password_based_file_with_rsa_key_fails_with_not_encrypted_for_key() {
-        let dir = tempdir().expect("tempdir");
-        let input = dir.path().join("plain.txt");
-        let enc = dir.path().join("password.enc");
-        let decrypted = dir.path().join("decrypted.txt");
-
+        let dir = tempdir().unwrap();
+        let (input, enc) = (
+            dir.path().join("plain.txt"),
+            dir.path().join("password.enc"),
+        );
         std::fs::write(&input, b"chiffre par mot de passe, pas par cle RSA").unwrap();
-
-        // Paramètres Argon2 minimaux (bornes de policy de chiffre_aes_core)
-        // pour que ce test reste rapide — la valeur de sécurité réelle
-        // n'a aucune importance ici, seul le chemin `key_source = 0`
-        // (mot de passe) est exercé.
         let password: chiffre_aes_core::Password =
-            zeroize::Zeroizing::new("mot-de-passe-de-test".to_string());
+            Zeroizing::new("mot-de-passe-de-test".to_string());
         let params = chiffre_aes_core::Argon2Params {
             memory_kib: 8 * 1024,
             iterations: 1,
             parallelism: 1,
         };
-        chiffre_aes_core::encrypt_file(&input, &enc, &password, params)
-            .expect("chiffrement par mot de passe (v1)");
+        chiffre_aes_core::encrypt_file(&input, &enc, &password, params).unwrap();
 
-        let result = decrypt_file_with_key(&enc, &decrypted, key_alice());
+        let (_, expected) = alice_only();
+        let result = decrypt_file_with_key(&enc, &dir.path().join("o"), key_alice(), &expected);
+        assert!(matches!(result, Err(EnvelopeError::NotEncryptedForKey)));
+        let bytes = std::fs::read(&enc).unwrap();
+        let result = decrypt_bytes_with_key(&bytes, key_alice(), &expected);
         assert!(matches!(result, Err(EnvelopeError::NotEncryptedForKey)));
     }
 
-    // --- encrypt_paths_for_recipients / decrypt_paths_with_key ---------
+    // --- Expéditeur ------------------------------------------------------------
+
+    #[test]
+    fn file_signed_by_unexpected_sender_is_refused_without_output() {
+        // Bob connaît la clé publique d'Alice et lui écrit en son propre nom ;
+        // Alice n'attend qu'elle-même.
+        let dir = tempdir().unwrap();
+        let (input, enc, out) = (
+            dir.path().join("plain.txt"),
+            dir.path().join("out.enc"),
+            dir.path().join("o"),
+        );
+        std::fs::write(&input, b"faux message").unwrap();
+        let (alice, expected) = alice_only();
+        encrypt_file_for_recipients(
+            &input,
+            &enc,
+            &[RecipientRef { public_key: &alice }],
+            key_bob(),
+        )
+        .unwrap();
+
+        let result = decrypt_file_with_key(&enc, &out, key_alice(), &expected);
+        assert!(
+            matches!(result, Err(EnvelopeError::SenderNotVerified)),
+            "{result:?}"
+        );
+        assert!(!out.exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "aucun temporaire"
+        );
+    }
+
+    /// Annonce l'empreinte d'Alice mais signe avec la clé de Bob.
+    struct Usurpateur;
+    impl SenderSigner for Usurpateur {
+        fn sender_id(&self) -> Vec<u8> {
+            key_alice().public_key().fingerprint().to_vec()
+        }
+        fn sign(&self, transcript: &[u8; 32]) -> Vec<u8> {
+            key_bob().sign(&signed_message(transcript))
+        }
+    }
+
+    /// Signe avec la bonne clé, mais sans le préfixe de ce crate : une
+    /// signature RSA-PSS de la même clé faite pour un autre usage.
+    struct SansDomaine;
+    impl SenderSigner for SansDomaine {
+        fn sender_id(&self) -> Vec<u8> {
+            key_alice().public_key().fingerprint().to_vec()
+        }
+        fn sign(&self, transcript: &[u8; 32]) -> Vec<u8> {
+            key_alice().sign(transcript)
+        }
+    }
+
+    #[test]
+    fn spoofed_sender_or_foreign_signature_is_refused() {
+        let alice = key_alice().public_key();
+        let expected = vec![alice.clone()];
+        for signer in [&Usurpateur as &dyn SenderSigner, &SansDomaine] {
+            let cek = RawKey::generate_random();
+            let sealed = vec![Recipient {
+                recipient_id: alice.fingerprint().to_vec(),
+                wrapped_key: alice.wrap_key(&cek).unwrap(),
+            }];
+            let container =
+                chiffre_aes_core::encrypt_bytes_for_recipients(b"x", cek, &sealed, signer).unwrap();
+            let result = decrypt_bytes_with_key(&container, key_alice(), &expected);
+            assert!(
+                matches!(result, Err(EnvelopeError::SenderNotVerified)),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn several_expected_senders_identifies_the_actual_one() {
+        let alice = key_alice().public_key();
+        let container = encrypt_bytes_for_recipients(
+            b"bonjour",
+            &[RecipientRef { public_key: &alice }],
+            key_bob(),
+        )
+        .unwrap();
+        let expected = vec![key_outsider().public_key(), key_bob().public_key()];
+        let (plaintext, sender) =
+            decrypt_bytes_with_key(&container, key_alice(), &expected).unwrap();
+        assert_eq!(&plaintext[..], b"bonjour");
+        assert_eq!(sender, key_bob().public_key().fingerprint());
+    }
+
+    #[test]
+    fn inspection_reveals_sender_and_recipients_without_secret() {
+        let (alice, bob) = (key_alice().public_key(), key_bob().public_key());
+        let container = encrypt_bytes_for_recipients(
+            b"x",
+            &[
+                RecipientRef { public_key: &alice },
+                RecipientRef { public_key: &bob },
+            ],
+            key_bob(),
+        )
+        .unwrap();
+        let info = inspect_bytes(&container).unwrap();
+        assert_eq!(info.sender_fingerprint, bob.fingerprint().to_vec());
+        assert_eq!(
+            info.recipient_fingerprints,
+            vec![alice.fingerprint().to_vec(), bob.fingerprint().to_vec()]
+        );
+    }
+
+    // --- Archives ------------------------------------------------------------
+
+    fn encrypt_paths_for_alice(paths: &[PathBuf], enc: &Path) -> Vec<ArchiveWarning> {
+        let alice = key_alice().public_key();
+        encrypt_paths_for_recipients(
+            paths,
+            enc,
+            &[RecipientRef { public_key: &alice }],
+            key_alice(),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn paths_roundtrip_multiple_files_new_destination() {
-        let dir = tempdir().expect("tempdir");
-        let file_a = dir.path().join("a.txt");
-        let file_b = dir.path().join("b.txt");
+        let dir = tempdir().unwrap();
+        let (file_a, file_b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
         std::fs::write(&file_a, b"contenu A").unwrap();
         std::fs::write(&file_b, b"contenu B, un peu plus long pour varier").unwrap();
-
         let enc = dir.path().join("archive.enc");
-        let alice_public = key_alice().public_key();
+        assert!(encrypt_paths_for_alice(&[file_a, file_b], &enc).is_empty());
 
-        let warnings = encrypt_paths_for_recipients(
-            &[file_a.clone(), file_b.clone()],
-            &enc,
-            &[RecipientRef {
-                public_key: &alice_public,
-            }],
-        )
-        .expect("chiffrement multi-fichiers");
-        assert!(warnings.is_empty());
-
-        // destination n'existe pas encore : exerce la branche
-        // "bascule atomique via rename".
         let dest = dir.path().join("destination_absente");
-        assert!(!dest.exists());
-
-        let extract_warnings =
-            decrypt_paths_with_key(&enc, &dest, key_alice()).expect("déchiffrement multi-fichiers");
-        assert!(extract_warnings.is_empty());
-
+        let (_, expected) = alice_only();
+        let (warnings, sender) =
+            decrypt_paths_with_key(&enc, &dest, key_alice(), &expected).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(sender, key_alice().public_key().fingerprint());
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"contenu A");
         assert_eq!(
             std::fs::read(dest.join("b.txt")).unwrap(),
@@ -512,30 +674,21 @@ mod tests {
 
     #[test]
     fn paths_roundtrip_existing_destination() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir().unwrap();
         let file_a = dir.path().join("a.txt");
         std::fs::write(&file_a, b"contenu existant").unwrap();
-
         let enc = dir.path().join("archive.enc");
-        let alice_public = key_alice().public_key();
-        encrypt_paths_for_recipients(
-            &[file_a],
-            &enc,
-            &[RecipientRef {
-                public_key: &alice_public,
-            }],
-        )
-        .expect("chiffrement");
+        encrypt_paths_for_alice(&[file_a], &enc);
 
-        // destination existe déjà (avec un fichier sans rapport) :
-        // exerce la branche non atomique documentée.
         let dest = dir.path().join("destination_existante");
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("deja_present.txt"), b"ne doit pas disparaitre").unwrap();
-
-        decrypt_paths_with_key(&enc, &dest, key_alice()).expect("déchiffrement");
-
-        assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"contenu existant");
+        let (_, expected) = alice_only();
+        decrypt_paths_with_key(&enc, &dest, key_alice(), &expected).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("a.txt")).unwrap(),
+            b"contenu existant"
+        );
         assert_eq!(
             std::fs::read(dest.join("deja_present.txt")).unwrap(),
             b"ne doit pas disparaitre"
@@ -543,139 +696,101 @@ mod tests {
     }
 
     #[test]
-    fn paths_multi_recipients_each_can_decrypt() {
-        let dir = tempdir().expect("tempdir");
+    fn paths_signed_by_unexpected_sender_extracts_nothing() {
+        let dir = tempdir().unwrap();
         let file_a = dir.path().join("a.txt");
-        std::fs::write(&file_a, b"partage entre plusieurs destinataires").unwrap();
-
+        std::fs::write(&file_a, b"x").unwrap();
         let enc = dir.path().join("archive.enc");
-        let alice_public = key_alice().public_key();
-        let bob_public = key_bob().public_key();
-
+        let alice = key_alice().public_key();
         encrypt_paths_for_recipients(
             &[file_a],
             &enc,
-            &[
-                RecipientRef {
-                    public_key: &alice_public,
-                },
-                RecipientRef {
-                    public_key: &bob_public,
-                },
-            ],
+            &[RecipientRef { public_key: &alice }],
+            key_outsider(),
         )
-        .expect("chiffrement");
+        .unwrap();
 
-        let dest_alice = dir.path().join("dest_alice");
-        decrypt_paths_with_key(&enc, &dest_alice, key_alice()).expect("déchiffrement Alice");
-        assert_eq!(
-            std::fs::read(dest_alice.join("a.txt")).unwrap(),
-            b"partage entre plusieurs destinataires"
+        let dest = dir.path().join("dest");
+        let (_, expected) = alice_only();
+        let result = decrypt_paths_with_key(&enc, &dest, key_alice(), &expected);
+        assert!(
+            matches!(result, Err(EnvelopeError::SenderNotVerified)),
+            "{result:?}"
         );
-
-        let dest_bob = dir.path().join("dest_bob");
-        decrypt_paths_with_key(&enc, &dest_bob, key_bob()).expect("déchiffrement Bob");
+        assert!(!dest.exists());
         assert_eq!(
-            std::fs::read(dest_bob.join("a.txt")).unwrap(),
-            b"partage entre plusieurs destinataires"
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "aucun temporaire"
         );
     }
 
     #[test]
     fn paths_encrypt_with_no_recipients_fails() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir().unwrap();
         let file_a = dir.path().join("a.txt");
         std::fs::write(&file_a, b"peu importe").unwrap();
-        let enc = dir.path().join("archive.enc");
-
-        let result = encrypt_paths_for_recipients(&[file_a], &enc, &[]);
+        let result =
+            encrypt_paths_for_recipients(&[file_a], &dir.path().join("a.enc"), &[], key_alice());
         assert!(matches!(result, Err(EnvelopeError::NoRecipients)));
     }
 
     #[test]
     fn paths_decrypt_with_non_recipient_key_fails() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir().unwrap();
         let file_a = dir.path().join("a.txt");
         std::fs::write(&file_a, b"reserve a alice").unwrap();
         let enc = dir.path().join("archive.enc");
-
-        let alice_public = key_alice().public_key();
-        encrypt_paths_for_recipients(
-            &[file_a],
-            &enc,
-            &[RecipientRef {
-                public_key: &alice_public,
-            }],
-        )
-        .expect("chiffrement");
-
-        let dest = dir.path().join("dest");
-        let result = decrypt_paths_with_key(&enc, &dest, key_outsider());
+        encrypt_paths_for_alice(&[file_a], &enc);
+        let (_, expected) = alice_only();
+        let result =
+            decrypt_paths_with_key(&enc, &dir.path().join("dest"), key_outsider(), &expected);
         assert!(matches!(result, Err(EnvelopeError::RecipientNotFound)));
     }
 
     #[test]
     fn paths_encrypt_rejects_duplicate_entry_names() {
-        let dir = tempdir().expect("tempdir");
-        // Deux chemins différents, mais même nom de fichier final —
-        // collision d'entrée d'archive.
-        let subdir_a = dir.path().join("sous_dossier_a");
-        let subdir_b = dir.path().join("sous_dossier_b");
+        let dir = tempdir().unwrap();
+        let (subdir_a, subdir_b) = (dir.path().join("a"), dir.path().join("b"));
         std::fs::create_dir_all(&subdir_a).unwrap();
         std::fs::create_dir_all(&subdir_b).unwrap();
-        let file_a = subdir_a.join("meme_nom.txt");
-        let file_b = subdir_b.join("meme_nom.txt");
+        let (file_a, file_b) = (subdir_a.join("meme_nom.txt"), subdir_b.join("meme_nom.txt"));
         std::fs::write(&file_a, b"contenu A").unwrap();
         std::fs::write(&file_b, b"contenu B").unwrap();
-
         let enc = dir.path().join("archive.enc");
-        let alice_public = key_alice().public_key();
-
+        let alice = key_alice().public_key();
         let result = encrypt_paths_for_recipients(
             &[file_a, file_b],
             &enc,
-            &[RecipientRef {
-                public_key: &alice_public,
-            }],
+            &[RecipientRef { public_key: &alice }],
+            key_alice(),
         );
         assert!(matches!(
             result,
             Err(EnvelopeError::DuplicateArchiveEntryName(name)) if name == "meme_nom.txt"
         ));
-        // Rien n'a été écrit : la vérification a lieu avant tout accès
-        // au fichier de sortie.
         assert!(!enc.exists());
     }
 
     #[test]
     fn paths_decrypt_into_existing_destination_detects_conflict_and_moves_nothing() {
-        let dir = tempdir().expect("tempdir");
+        let dir = tempdir().unwrap();
         let file_a = dir.path().join("a.txt");
         std::fs::write(&file_a, b"nouveau contenu").unwrap();
-
         let enc = dir.path().join("archive.enc");
-        let alice_public = key_alice().public_key();
-        encrypt_paths_for_recipients(
-            &[file_a],
-            &enc,
-            &[RecipientRef {
-                public_key: &alice_public,
-            }],
-        )
-        .expect("chiffrement");
+        encrypt_paths_for_alice(&[file_a], &enc);
 
-        // La destination existe déjà ET contient une entrée du même nom
-        // que ce qui va être extrait ("a.txt") : collision volontaire.
         let dest = dir.path().join("destination_avec_collision");
         std::fs::create_dir_all(&dest).unwrap();
         std::fs::write(dest.join("a.txt"), b"ancien contenu a NE PAS ecraser").unwrap();
         std::fs::write(dest.join("autre_fichier.txt"), b"present avant").unwrap();
 
-        let result = decrypt_paths_with_key(&enc, &dest, key_alice());
-        assert!(matches!(result, Err(EnvelopeError::DestinationConflict(name)) if name.ends_with("a.txt")));
-
-        // Aucune entrée n'a été déplacée (validation en deux passes) :
-        // l'ancien contenu est intact, rien de nouveau n'est apparu.
+        let (_, expected) = alice_only();
+        let result = decrypt_paths_with_key(&enc, &dest, key_alice(), &expected);
+        assert!(
+            matches!(&result, Err(EnvelopeError::DestinationConflict(m)) if m.contains("a.txt")),
+            "{result:?}"
+        );
         assert_eq!(
             std::fs::read(dest.join("a.txt")).unwrap(),
             b"ancien contenu a NE PAS ecraser"
@@ -688,32 +803,23 @@ mod tests {
 
     #[test]
     fn paths_supports_reserved_metadata_filenames_alongside_real_content() {
-        // Vérifie le mécanisme décrit dans FORMAT.md §6.1 : l'app peut
-        // glisser _expediteur.json/_destinataires.json dans
-        // selected_paths comme n'importe quel autre fichier — ce crate
-        // ne leur fait subir aucun traitement spécial, il les archive
-        // tels quels.
-        let dir = tempdir().expect("tempdir");
+        // FORMAT.md §5.1 : l'application peut glisser _expediteur.json /
+        // _destinataires.json parmi les chemins ; ils sont archivés tels quels.
+        let dir = tempdir().unwrap();
         let content = dir.path().join("contenu.txt");
         let sender_doc = dir.path().join("_expediteur.json");
         std::fs::write(&content, b"le vrai contenu").unwrap();
         std::fs::write(&sender_doc, br#"{"identity":"alice"}"#).unwrap();
-
         let enc = dir.path().join("archive.enc");
-        let alice_public = key_alice().public_key();
-        encrypt_paths_for_recipients(
-            &[content, sender_doc],
-            &enc,
-            &[RecipientRef {
-                public_key: &alice_public,
-            }],
-        )
-        .expect("chiffrement avec métadonnées");
+        encrypt_paths_for_alice(&[content, sender_doc], &enc);
 
         let dest = dir.path().join("dest");
-        decrypt_paths_with_key(&enc, &dest, key_alice()).expect("déchiffrement");
-
-        assert_eq!(std::fs::read(dest.join("contenu.txt")).unwrap(), b"le vrai contenu");
+        let (_, expected) = alice_only();
+        decrypt_paths_with_key(&enc, &dest, key_alice(), &expected).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("contenu.txt")).unwrap(),
+            b"le vrai contenu"
+        );
         assert_eq!(
             std::fs::read(dest.join("_expediteur.json")).unwrap(),
             br#"{"identity":"alice"}"#

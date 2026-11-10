@@ -11,21 +11,21 @@ cargo about generate about.hbs > NOTICE.md
 
 | Crate | Licence |
 |---|---|
-| chiffre-rsa-core | MIT OR Apache-2.0 (v1.0.0, tag Git — voir sa propre `NOTICE.md`) |
-| chiffre_aes_core | MIT OR Apache-2.0 (v2.0.0, tag Git — voir sa propre `NOTICE.md`) |
+| chiffre-rsa-core | MIT OR Apache-2.0 (v2.0.0, tag Git — voir sa propre `NOTICE.md`) |
+| chiffre_aes_core | MIT OR Apache-2.0 (v3.0.0, tag Git — voir sa propre `NOTICE.md`) |
 | thiserror | MIT OR Apache-2.0 |
-| tempfile | MIT OR Apache-2.0 — passé de dépendance de développement à dépendance normale (utilisée par `encrypt_paths_for_recipients`/`decrypt_paths_with_key` pour les fichiers/dossiers temporaires) |
+| zeroize | Apache-2.0 OR MIT — clair renvoyé par `decrypt_bytes_with_key`, effacé à sa destruction |
 
 ## Dépendances de développement uniquement (tests)
 
 | Crate | Licence |
 |---|---|
-| zeroize | Apache-2.0 OR MIT |
+| tempfile | MIT OR Apache-2.0 — redevenu dépendance de test en 2.0.0 : les fichiers et dossiers temporaires sont gérés par `chiffre_aes_core` |
 
 ## Dépendances transitives
 
 Toutes celles de `chiffre-rsa-core` (voir sa `NOTICE.md`) s'appliquent
 également ici par transitivité. Aucune dépendance transitive
-supplémentaire propre à ce crate au-delà de `thiserror`/`tempfile`
+supplémentaire propre à ce crate au-delà de `thiserror`/`zeroize`
 elles-mêmes (MIT OR Apache-2.0, sans dépendance non triviale). À
 reconfirmer avec `cargo about`/`cargo license` avant toute release.
