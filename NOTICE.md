@@ -11,8 +11,8 @@ cargo about generate about.hbs > NOTICE.md
 
 | Crate | Licence |
 |---|---|
-| chiffre-rsa-core | MIT OR Apache-2.0 (v2.0.0, tag Git — voir sa propre `NOTICE.md`) |
-| chiffre_aes_core | MIT OR Apache-2.0 (v3.0.0, tag Git — voir sa propre `NOTICE.md`) |
+| chiffre-rsa-core | MIT OR Apache-2.0 (v2.0.1, tag Git — voir sa propre `NOTICE.md`) |
+| chiffre_aes_core | MIT OR Apache-2.0 (v3.1.0, tag Git — voir sa propre `NOTICE.md`) |
 | thiserror | MIT OR Apache-2.0 |
 | zeroize | Apache-2.0 OR MIT — clair renvoyé par `decrypt_bytes_with_key`, effacé à sa destruction |
 

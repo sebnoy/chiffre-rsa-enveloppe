@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.1.0
+
+**Ajout, sans changement de format.**
+
+- **`decrypt_bytes_with_key_from_presented_sender`** — déchiffre le premier
+  message d'un expéditeur encore inconnu, dont la clé est jointe au contenu
+  (son certificat). L'application fournit `present`, qui trouve et valide
+  cette clé dans le contenu déchiffré ; l'enveloppe vérifie ensuite qu'elle
+  correspond à l'expéditeur annoncé et que la signature est valide. Rien n'est
+  rendu sinon (`SenderNotVerified`). `FORMAT.md` §2.1.
+- **Dépendances** — `chiffre_aes_core` v3.1.0, `chiffre-rsa-core` v2.0.1
+  (fuzzing compris).
+- Tests : 20 (expéditeur présenté accepté et identifié ; usurpation et
+  expéditeur sans autorité refusés).
+
 ## v2.0.0
 
 **Format v3 de `chiffre_aes_core` : chaque fichier est signé par son

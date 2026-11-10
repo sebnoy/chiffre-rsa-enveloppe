@@ -76,6 +76,15 @@ aussi à déchiffrer ce qu'on lui envoie.
 - `inspect_file` / `inspect_bytes` donnent l'expéditeur **annoncé** sans
   secret, pour choisir la liste des expéditeurs attendus ; il n'est
   vérifié qu'au déchiffrement.
+- **Expéditeur présenté dans le contenu** (2.1.0,
+  `decrypt_bytes_with_key_from_presented_sender`) : quand la clé de
+  l'expéditeur n'est connue qu'à travers le contenu (premier message
+  portant son certificat), l'application fournit `present`, qui reçoit le
+  contenu déchiffré — authentifié par la clé de contenu, **pas encore par
+  l'expéditeur** — et renvoie la clé seulement après en avoir établi
+  l'autorité (certificat signé par une clé admin déjà figée). Mêmes
+  contrôles ensuite : empreinte égale à `sender_id`, signature valide,
+  sinon `SenderNotVerified` et contenu effacé sans être rendu.
 
 La même paire RSA sert au chiffrement (OAEP) et à la signature (PSS),
 comme dans les applications qui l'utilisent déjà ; les deux usages

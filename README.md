@@ -18,6 +18,11 @@ pub fn encrypt_bytes_for_recipients(plaintext: &[u8],
 pub fn decrypt_bytes_with_key(container: &[u8], key: &RsaKeyPair,
     expected_senders: &[RsaPublicKey]) -> Result<(Zeroizing<Vec<u8>>, Fingerprint), EnvelopeError>;
 
+// Premier message d'un expéditeur inconnu : sa clé est trouvée dans le contenu
+// par `present`, après vérification de son certificat par l'application (2.1.0)
+pub fn decrypt_bytes_with_key_from_presented_sender(container: &[u8], key: &RsaKeyPair,
+    present: impl Fn(&[u8]) -> Option<RsaPublicKey>) -> Result<(Zeroizing<Vec<u8>>, Fingerprint), EnvelopeError>;
+
 // Fichiers et dossiers
 pub fn encrypt_paths_for_recipients(selected_paths: &[PathBuf], output: &Path,
     recipients: &[RecipientRef], sender: &RsaKeyPair) -> Result<Vec<ArchiveWarning>, EnvelopeError>;
@@ -31,8 +36,8 @@ pub fn inspect_bytes(container: &[u8]) -> Result<EnvelopeInfo, EnvelopeError>;
 
 # Statut
 
-v2.0.0. Dépend de `chiffre_aes_core` v3.0.0 et de `chiffre-rsa-core`
-v2.0.0 (tags Git) — voir [NOTICE.md](./NOTICE.md). **Les fichiers des
+v2.1.0. Dépend de `chiffre_aes_core` v3.1.0 et de `chiffre-rsa-core`
+v2.0.1 (tags Git) — voir [NOTICE.md](./NOTICE.md). **Les fichiers des
 versions 1.x (format v2) ne sont plus lisibles** : ce format ne protégeait
 pas contre un destinataire et n'identifiait pas l'expéditeur.
 

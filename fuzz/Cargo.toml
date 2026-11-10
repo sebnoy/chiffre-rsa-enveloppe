@@ -20,7 +20,7 @@ path = ".."
 # `RsaKeyPair` coexistent et les cibles ne compilent pas.
 [dependencies.chiffre-rsa-core]
 git = "https://github.com/sebnoy/chiffre-rsa-core"
-tag = "v2.0.0"
+tag = "v2.0.1"
 
 [profile.release]
 debug = 1

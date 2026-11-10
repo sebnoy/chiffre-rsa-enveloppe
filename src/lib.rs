@@ -19,8 +19,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chiffre_aes_core::{
-    ArchiveError, ArchiveWarning, ExtractionLimits, FormatError, PipelineError, RawKey, Recipient,
-    RecipientsInfo, SenderSigner, SenderVerifier,
+    ArchiveError, ArchiveWarning, ExtractionLimits, FormatError, PipelineError,
+    PresentedSenderVerifier, RawKey, Recipient, RecipientsInfo, SenderSigner, SenderVerifier,
 };
 use chiffre_rsa_core::{RsaKeyPair, RsaKeysError, RsaPublicKey};
 use zeroize::Zeroizing;
@@ -301,6 +301,77 @@ pub fn decrypt_bytes_with_key(
             .map(|p| plaintext = Some(p)),
     )?;
     Ok((plaintext.expect("rempli en cas de succès"), sender))
+}
+
+/// Vérificateur d'un expéditeur présenté dans le contenu : `present` y trouve
+/// la clé candidate ; elle doit correspondre à `sender_id` et la signature
+/// doit être valide pour elle.
+struct PresentedRsaVerifier<F> {
+    present: F,
+    verified: Cell<Option<Fingerprint>>,
+    refused: Cell<bool>,
+}
+
+impl<F: Fn(&[u8]) -> Option<RsaPublicKey>> PresentedSenderVerifier for PresentedRsaVerifier<F> {
+    fn verify(
+        &self,
+        plaintext: &[u8],
+        sender_id: &[u8],
+        transcript: &[u8; 32],
+        signature: &[u8],
+    ) -> bool {
+        let accepted = (self.present)(plaintext).and_then(|key| {
+            let fingerprint = key.fingerprint();
+            (fingerprint.as_slice() == sender_id
+                && key.verify(&signed_message(transcript), signature).is_ok())
+            .then_some(fingerprint)
+        });
+        self.verified.set(accepted);
+        self.refused.set(accepted.is_none());
+        accepted.is_some()
+    }
+}
+
+/// Déchiffre en mémoire le message d'un expéditeur **qui se présente dans le
+/// contenu** (par exemple le premier message d'un contact, portant son
+/// certificat), quand sa clé n'est pas encore connue.
+///
+/// `present` reçoit le contenu déchiffré, **authentifié par la clé de contenu
+/// mais pas encore par l'expéditeur** (n'importe quel destinataire aurait pu
+/// l'écrire). Elle doit renvoyer la clé de l'expéditeur **seulement après en
+/// avoir établi l'autorité par un moyen indépendant** — typiquement : le
+/// certificat joint est signé par une clé admin déjà figée par
+/// l'application — et `None` sinon. Le message est ensuite accepté seulement
+/// si l'expéditeur annoncé dans l'en-tête est cette clé et si la signature est
+/// valide pour elle ; sinon [`EnvelopeError::SenderNotVerified`], et le
+/// contenu est effacé sans être rendu.
+pub fn decrypt_bytes_with_key_from_presented_sender<F>(
+    container: &[u8],
+    key: &RsaKeyPair,
+    present: F,
+) -> Result<(Zeroizing<Vec<u8>>, Fingerprint), EnvelopeError>
+where
+    F: Fn(&[u8]) -> Option<RsaPublicKey>,
+{
+    let cek = unseal(&recipients_of_bytes(container)?, key)?;
+    let verifier = PresentedRsaVerifier {
+        present,
+        verified: Cell::new(None),
+        refused: Cell::new(false),
+    };
+    match chiffre_aes_core::decrypt_bytes_from_presented_sender(container, cek, &verifier) {
+        Ok(plaintext) => {
+            let sender = verifier
+                .verified
+                .get()
+                .ok_or(EnvelopeError::SenderNotVerified)?;
+            Ok((plaintext, sender))
+        }
+        Err(FormatError::Corrupted) if verifier.refused.get() => {
+            Err(EnvelopeError::SenderNotVerified)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ============================================================================
@@ -634,6 +705,75 @@ mod tests {
         assert_eq!(
             info.recipient_fingerprints,
             vec![alice.fingerprint().to_vec(), bob.fingerprint().to_vec()]
+        );
+    }
+
+    // --- Expéditeur présenté dans le contenu ---------------------------------
+
+    /// Contenu de test : « <empreinte hex de l'expéditeur>\n<texte> ».
+    fn presentation(sender: &RsaPublicKey, texte: &str) -> Vec<u8> {
+        let hex: String = sender
+            .fingerprint()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("{hex}\n{texte}").into_bytes()
+    }
+
+    /// « Certificats » de confiance : l'application ne connaît que Bob.
+    fn trouve_bob(plaintext: &[u8]) -> Option<RsaPublicKey> {
+        let bob = key_bob().public_key();
+        let annonce = plaintext.split(|b| *b == b'\n').next()?;
+        (annonce == &presentation(&bob, "")[..64]).then_some(bob)
+    }
+
+    #[test]
+    fn presented_sender_is_accepted_and_identified() {
+        let alice = key_alice().public_key();
+        let bob = key_bob().public_key();
+        let container = encrypt_bytes_for_recipients(
+            &presentation(&bob, "premier message"),
+            &[RecipientRef { public_key: &alice }],
+            key_bob(),
+        )
+        .unwrap();
+        let (clair, sender) =
+            decrypt_bytes_with_key_from_presented_sender(&container, key_alice(), trouve_bob)
+                .unwrap();
+        assert_eq!(sender, bob.fingerprint());
+        assert!(clair.ends_with(b"premier message"));
+    }
+
+    #[test]
+    fn presented_sender_impersonation_is_refused() {
+        // Le tiers se présente comme Bob mais signe avec sa propre clé.
+        let alice = key_alice().public_key();
+        let bob = key_bob().public_key();
+        let container = encrypt_bytes_for_recipients(
+            &presentation(&bob, "faux"),
+            &[RecipientRef { public_key: &alice }],
+            key_outsider(),
+        )
+        .unwrap();
+        let result =
+            decrypt_bytes_with_key_from_presented_sender(&container, key_alice(), trouve_bob);
+        assert!(
+            matches!(result, Err(EnvelopeError::SenderNotVerified)),
+            "{result:?}"
+        );
+        // Le tiers se présente sous son propre nom : aucune autorité établie.
+        let tiers = key_outsider().public_key();
+        let container = encrypt_bytes_for_recipients(
+            &presentation(&tiers, "x"),
+            &[RecipientRef { public_key: &alice }],
+            key_outsider(),
+        )
+        .unwrap();
+        let result =
+            decrypt_bytes_with_key_from_presented_sender(&container, key_alice(), trouve_bob);
+        assert!(
+            matches!(result, Err(EnvelopeError::SenderNotVerified)),
+            "{result:?}"
         );
     }
 
